@@ -1,0 +1,4 @@
+<resources>
+    <item name="motion_color" type="id" />
+    <item name="material_surface" type="id" />
+</resources>

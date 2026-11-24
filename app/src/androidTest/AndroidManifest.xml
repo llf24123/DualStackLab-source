@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <application>
+        <activity android:name="org.example.filemanager.OpenTargetActivity" android:label="外部验证" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+        <receiver android:name="org.example.filemanager.CountingDocumentsProvider$GrantReceiver"
+            android:exported="true" />
+        <provider android:name="org.example.filemanager.CountingDocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:permission="android.permission.MANAGE_DOCUMENTS"
+            android:exported="true" android:grantUriPermissions="true" />
+        <provider android:name="org.example.filemanager.ExternalFixtureProvider"
+            android:authorities="${applicationId}.external"
+            android:exported="true" android:grantUriPermissions="true" />
+    </application>
+</manifest>

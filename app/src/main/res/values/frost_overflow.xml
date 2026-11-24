@@ -1,0 +1,6 @@
+<resources>
+    <style name="FrostOverflowMotion">
+        <item name="android:windowEnterAnimation">@anim/frost_overflow_enter</item>
+        <item name="android:windowExitAnimation">@anim/frost_overflow_exit</item>
+    </style>
+</resources>

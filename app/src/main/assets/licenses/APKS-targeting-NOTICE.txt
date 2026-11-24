@@ -1,0 +1,11 @@
+APKS targeting interoperability
+
+The wire field schema follows google/bundletool commands.proto and targeting.proto.
+Density and multi-ABI selection were adapted from the Android/bundletool resource matching rules.
+Copyright (C) 2017-2018 The Android Open Source Project
+Licensed under Apache License 2.0 (bundletool-Apache-2.0.txt).
+Sources:
+https://github.com/google/bundletool/tree/master/src/main/proto
+https://github.com/google/bundletool/blob/master/src/main/java/com/android/tools/build/bundletool/model/targeting/ScreenDensitySelector.java
+https://github.com/google/bundletool/blob/master/src/main/java/com/android/tools/build/bundletool/device/MultiAbiMatcher.java
+DualStackLab uses its own bounded wire reader and Android integration; desktop bundletool is not bundled.

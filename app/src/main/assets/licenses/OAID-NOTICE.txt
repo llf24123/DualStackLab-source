@@ -1,0 +1,9 @@
+OAID protocol references
+
+Android_CN_OAID
+https://github.com/gzu-liyujiang/Android_CN_OAID
+Copyright (c) 2016-present. 贵州纳雍穿青人李裕江 and All Contributors.
+Licensed under Mulan PSL v2. Full license in Android_CN_OAID-MulanPSL2.txt.
+
+The vendor protocol adapters in org.example.filemanager.Oaid were rewritten for
+background device inventory with bounded waits and connection cleanup.

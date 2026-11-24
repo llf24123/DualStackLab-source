@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="LabTideDay" parent="Theme.DualStack">
+        <item name="android:windowBackground">#F8FCFC</item>
+        <item name="android:colorBackground">#F8FCFC</item>
+        <item name="android:colorBackgroundFloating">#F8FCFC</item>
+        <item name="android:colorForeground">#192F3B</item>
+        <item name="android:textColorPrimary">#192F3B</item>
+        <item name="android:textColorSecondary">#4A626D</item>
+        <item name="android:colorAccent">#176B7C</item>
+        <item name="android:colorControlActivated">#176B7C</item>
+        <item name="android:colorControlNormal">#4A626D</item>
+    </style>
+    <style name="LabTideNight" parent="Theme.DualStack.Dark">
+        <item name="android:windowBackground">#111C23</item>
+        <item name="android:colorBackground">#111C23</item>
+        <item name="android:colorBackgroundFloating">#1D2B34</item>
+        <item name="android:colorForeground">#E3EEF1</item>
+        <item name="android:textColorPrimary">#E3EEF1</item>
+        <item name="android:textColorSecondary">#A6BCC6</item>
+        <item name="android:colorAccent">#76CED8</item>
+        <item name="android:colorControlActivated">#76CED8</item>
+        <item name="android:colorControlNormal">#A6BCC6</item>
+    </style>
+    <style name="LabFrostDay" parent="Theme.DualStack">
+        <item name="android:windowBackground">#F9FAFB</item>
+        <item name="android:colorBackground">#F9FAFB</item>
+        <item name="android:colorBackgroundFloating">#F9FAFB</item>
+        <item name="android:colorForeground">#1D262E</item>
+        <item name="android:textColorPrimary">#1D262E</item>
+        <item name="android:textColorSecondary">#515E68</item>
+        <item name="android:colorAccent">#2166B6</item>
+        <item name="android:colorControlActivated">#2166B6</item>
+        <item name="android:colorControlNormal">#515E68</item>
+    </style>
+    <style name="LabFrostNight" parent="Theme.DualStack.Dark">
+        <item name="android:windowBackground">#101214</item>
+        <item name="android:colorBackground">#101214</item>
+        <item name="android:colorBackgroundFloating">#232629</item>
+        <item name="android:colorForeground">#F0F2F3</item>
+        <item name="android:textColorPrimary">#F0F2F3</item>
+        <item name="android:textColorSecondary">#B7BDC3</item>
+        <item name="android:colorAccent">#8BB7FF</item>
+        <item name="android:colorControlActivated">#8BB7FF</item>
+        <item name="android:colorControlNormal">#B7BDC3</item>
+    </style>
+    <style name="LabPaperDay" parent="Theme.DualStack">
+        <item name="android:windowBackground">#FCF6E9</item>
+        <item name="android:colorBackground">#FCF6E9</item>
+        <item name="android:colorBackgroundFloating">#FCF6E9</item>
+        <item name="android:colorForeground">#352F29</item>
+        <item name="android:textColorPrimary">#352F29</item>
+        <item name="android:textColorSecondary">#685C4F</item>
+        <item name="android:colorAccent">#80582D</item>
+        <item name="android:colorControlActivated">#80582D</item>
+        <item name="android:colorControlNormal">#685C4F</item>
+    </style>
+    <style name="LabPaperNight" parent="Theme.DualStack.Dark">
+        <item name="android:windowBackground">#201E1A</item>
+        <item name="android:colorBackground">#201E1A</item>
+        <item name="android:colorBackgroundFloating">#2E2A24</item>
+        <item name="android:colorForeground">#F2EADD</item>
+        <item name="android:textColorPrimary">#F2EADD</item>
+        <item name="android:textColorSecondary">#C5B7A4</item>
+        <item name="android:colorAccent">#DFBD89</item>
+        <item name="android:colorControlActivated">#DFBD89</item>
+        <item name="android:colorControlNormal">#C5B7A4</item>
+    </style>
+    <style name="LabAlertDay" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowMinWidthMinor">82%</item>
+        <item name="android:windowMinWidthMajor">50%</item>
+    </style>
+    <style name="LabAlertNight" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:windowMinWidthMinor">82%</item>
+        <item name="android:windowMinWidthMajor">50%</item>
+    </style>
+    <style name="AlertTideDay" parent="LabAlertDay">
+        <item name="android:colorAccent">#176B7C</item><item name="android:colorControlActivated">#176B7C</item>
+        <item name="android:textColorPrimary">#192F3B</item><item name="android:textColorSecondary">#4A626D</item>
+    </style>
+    <style name="AlertTideNight" parent="LabAlertNight">
+        <item name="android:colorAccent">#76CED8</item><item name="android:colorControlActivated">#76CED8</item>
+        <item name="android:textColorPrimary">#E3EEF1</item><item name="android:textColorSecondary">#A6BCC6</item>
+    </style>
+    <style name="AlertFrostDay" parent="LabAlertDay">
+        <item name="android:colorAccent">#2166B6</item><item name="android:colorControlActivated">#2166B6</item>
+        <item name="android:textColorPrimary">#1D262E</item><item name="android:textColorSecondary">#515E68</item>
+    </style>
+    <style name="AlertFrostNight" parent="LabAlertNight">
+        <item name="android:colorAccent">#8BB7FF</item><item name="android:colorControlActivated">#8BB7FF</item>
+        <item name="android:textColorPrimary">#F0F2F3</item><item name="android:textColorSecondary">#B7BDC3</item>
+    </style>
+    <style name="AlertPaperDay" parent="LabAlertDay">
+        <item name="android:colorAccent">#80582D</item><item name="android:colorControlActivated">#80582D</item>
+        <item name="android:textColorPrimary">#352F29</item><item name="android:textColorSecondary">#685C4F</item>
+    </style>
+    <style name="AlertPaperNight" parent="LabAlertNight">
+        <item name="android:colorAccent">#DFBD89</item><item name="android:colorControlActivated">#DFBD89</item>
+        <item name="android:textColorPrimary">#F2EADD</item><item name="android:textColorSecondary">#C5B7A4</item>
+    </style>
+    <style name="AccentJadeDay">
+        <item name="android:colorAccent">#167D68</item>
+        <item name="android:colorControlActivated">#167D68</item>
+    </style>
+    <style name="AccentJadeNight">
+        <item name="android:colorAccent">#72CDB7</item>
+        <item name="android:colorControlActivated">#72CDB7</item>
+    </style>
+    <style name="AccentBlueDay">
+        <item name="android:colorAccent">#226BA3</item>
+        <item name="android:colorControlActivated">#226BA3</item>
+    </style>
+    <style name="AccentBlueNight">
+        <item name="android:colorAccent">#8BC7F2</item>
+        <item name="android:colorControlActivated">#8BC7F2</item>
+    </style>
+    <style name="AccentPlumDay">
+        <item name="android:colorAccent">#71459A</item>
+        <item name="android:colorControlActivated">#71459A</item>
+    </style>
+    <style name="AccentPlumNight">
+        <item name="android:colorAccent">#CBB1EE</item>
+        <item name="android:colorControlActivated">#CBB1EE</item>
+    </style>
+    <style name="AccentTeaDay">
+        <item name="android:colorAccent">#855C28</item>
+        <item name="android:colorControlActivated">#855C28</item>
+    </style>
+    <style name="AccentTeaNight">
+        <item name="android:colorAccent">#E5BD88</item>
+        <item name="android:colorControlActivated">#E5BD88</item>
+    </style>
+    <style name="AccentGraphiteDay">
+        <item name="android:colorAccent">#505E69</item>
+        <item name="android:colorControlActivated">#505E69</item>
+    </style>
+    <style name="AccentGraphiteNight">
+        <item name="android:colorAccent">#C0C6CB</item>
+        <item name="android:colorControlActivated">#C0C6CB</item>
+    </style>
+</resources>

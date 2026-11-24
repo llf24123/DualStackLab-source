@@ -1,0 +1,108 @@
+plugins {
+    id "com.android.application"
+}
+
+apply from: rootProject.file("gradle/junrar.gradle")
+
+// Installation identity is configurable; the Java namespace stays constant.
+def installProperties = new Properties()
+def installPropertiesFile = rootProject.file("application-id.properties")
+if (installPropertiesFile.isFile()) {
+    installPropertiesFile.withInputStream { installProperties.load(it) }
+}
+def installId = providers.gradleProperty("fileManagerApplicationId")
+        .getOrElse(installProperties.getProperty("applicationId", "org.example.filemanager")).trim()
+if (!(installId ==~ /[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+/)) {
+    throw new GradleException("Invalid application ID; use at least two dot-separated Android identifiers.")
+}
+
+// release 签名材料从 keystore.properties 读取（该文件不进仓库，见 docs/SIGNING.md）。
+// 文件不存在时退回不签名，便于没有密钥的机器直接 assembleRelease。
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+android {
+    buildFeatures {
+        aidl true
+        buildConfig true
+    }
+    namespace "org.example.filemanager"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId installId
+        testApplicationId "${installId}.test"
+        minSdk 26
+        targetSdk 36
+        versionCode 62
+        versionName "0.6.56"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties.getProperty("storeFile"))
+                storePassword keystoreProperties.getProperty("storePassword")
+                keyAlias keystoreProperties.getProperty("keyAlias")
+                keyPassword keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            debuggable false
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "dev.rikka.shizuku:api:13.1.5"
+    implementation "dev.rikka.shizuku:provider:13.1.5"
+    implementation "androidx.activity:activity:1.10.1"
+    implementation "androidx.exifinterface:exifinterface:1.4.2"
+    implementation "com.google.re2j:re2j:1.8"
+    implementation "com.github.florianingerl.util:regex:1.1.11"
+    implementation "androidx.swiperefreshlayout:swiperefreshlayout:1.2.0"
+    implementation project(":terminal-view")
+    implementation project(":terminal-emulator")
+    implementation "com.github.albfernandez:juniversalchardet:2.5.1"
+    implementation "io.github.rosemoe:editor:0.24.6"
+    implementation "io.github.rosemoe:language-java:0.24.6"
+    implementation "io.github.rosemoe:language-textmate:0.24.6"
+    implementation "net.lingala.zip4j:zip4j:2.11.5"
+    implementation "org.apache.commons:commons-compress:1.28.0"
+    implementation "org.tukaani:xz:1.10"
+    implementation "com.github.luben:zstd-jni:1.5.7-6@aar"
+    implementation "io.github.reandroid:ARSCLib:1.4.0"
+    implementation "org.smali:baksmali:2.5.2"
+    implementation "org.smali:smali:2.5.2"
+    implementation "com.android.tools.build:apksig:8.9.0"
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    implementation "com.github.mwiede:jsch:0.2.25"
+    implementation "eu.agno3.jcifs:jcifs-ng:2.1.10"
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+    testImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
+    androidTestImplementation "com.squareup.okhttp3:mockwebserver:4.12.0"
+    androidTestImplementation "com.squareup.okhttp3:okhttp-tls:4.12.0"
+}
+
+apply from: rootProject.file("gradle/source-fixtures.gradle")

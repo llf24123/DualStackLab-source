@@ -1,0 +1,2 @@
+# Copy to application-id.properties only when a different install ID is needed.
+applicationId=org.example.filemanager

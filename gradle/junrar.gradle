@@ -1,0 +1,28 @@
+// Junrar 8.1.2 with one source replacement; do not ship duplicate classes.
+def original = configurations.create("junrarOriginal") {
+    canBeConsumed = false
+    transitive = false
+}
+def compilePatch = tasks.register("compileJunrarPatch", JavaCompile) {
+    source rootProject.fileTree("third_party/junrar") { include "**/*.java" }
+    classpath = original
+    destinationDirectory = layout.buildDirectory.dir("junrar/compiled")
+    options.release = 17
+    options.encoding = "UTF-8"
+}
+def patchedJar = tasks.register("patchedJunrar", Jar) {
+    archiveFileName = "junrar-8.1.2-dualstack.jar"
+    destinationDirectory = layout.buildDirectory.dir("junrar")
+    from(compilePatch)
+    from({ zipTree(original.singleFile) }) {
+        exclude "com/github/junrar/unpack/ComprDataIO.class"
+        exclude "META-INF/MANIFEST.MF"
+    }
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+dependencies {
+    add(original.name, "com.github.junrar:junrar:8.1.2")
+    implementation files(patchedJar)
+    runtimeOnly "org.slf4j:slf4j-api:2.0.17"
+}

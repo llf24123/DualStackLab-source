@@ -1,0 +1,120 @@
+import javax.inject.Inject
+import org.gradle.process.ExecOperations
+import org.gradle.work.DisableCachingByDefault
+
+// Select the same toolchain for the app launcher and the instrumentation probe.
+android.ndkVersion = '26.3.11579264'
+
+@CacheableTask
+abstract class BuildElfAssets extends DefaultTask {
+    @InputFile @PathSensitive(PathSensitivity.RELATIVE) abstract RegularFileProperty getSourceFile()
+    @Input abstract Property<String> getAssetName()
+    @Input abstract Property<Integer> getApiLevel()
+    @Internal abstract DirectoryProperty getNdkDirectory()
+    @InputFile @PathSensitive(PathSensitivity.NONE) File getNdkRevision() {
+        return ndkDirectory.file('source.properties').get().asFile
+    }
+    @OutputDirectory abstract DirectoryProperty getOutputDirectory()
+    @Inject abstract ExecOperations getExecOperations()
+
+    @Input String getHostTag() {
+        String os = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+        if (os.startsWith('windows')) return 'windows-x86_64'
+        if (os.startsWith('mac')) return 'darwin-x86_64'
+        if (os.startsWith('linux')) return 'linux-x86_64'
+        throw new GradleException("Unsupported Android NDK host: $os")
+    }
+
+    @TaskAction void compile() {
+        String exe = hostTag.startsWith('windows') ? 'clang.exe' : 'clang'
+        File clang = ndkDirectory.file("toolchains/llvm/prebuilt/$hostTag/bin/$exe").get().asFile
+        File src = sourceFile.get().asFile
+        File out = outputDirectory.dir(assetName.get()).get().asFile
+        out.mkdirs()
+        def targets = ['arm64-v8a': 'aarch64-linux-android', 'armeabi-v7a': 'armv7a-linux-androideabi',
+                       'x86': 'i686-linux-android', 'x86_64': 'x86_64-linux-android']
+        targets.each { abi, target ->
+            execOperations.exec {
+                workingDir src.parentFile
+                commandLine clang, "--target=${target}${apiLevel.get()}", '-std=gnu11', '-O2', '-fPIE', '-pie',
+                        '-Wl,-z,max-page-size=16384', '-Wl,--build-id=sha1', '-Wl,-s', src.name, '-o', new File(out, abi)
+            }
+        }
+    }
+}
+
+@DisableCachingByDefault(because = 'Each regenerated installation fixture has a disposable signing key')
+abstract class BuildInstallFixture extends DefaultTask {
+    @InputFile @PathSensitive(PathSensitivity.RELATIVE) abstract RegularFileProperty getFixtureManifest()
+    @InputFile @PathSensitive(PathSensitivity.NONE) abstract RegularFileProperty getAndroidJar()
+    @Internal abstract DirectoryProperty getBuildToolsDirectory()
+    @InputFile @PathSensitive(PathSensitivity.NONE) File getBuildToolsRevision() {
+        return buildToolsDirectory.file('source.properties').get().asFile
+    }
+    @OutputDirectory abstract DirectoryProperty getOutputDirectory()
+    @Inject abstract ExecOperations getExecOperations()
+
+    @TaskAction void assemble() {
+        boolean windows = System.getProperty('os.name').toLowerCase(Locale.ROOT).startsWith('windows')
+        String ext = windows ? '.exe' : ''
+        File tools = buildToolsDirectory.get().asFile
+        File jdkBin = new File(System.getProperty('java.home'), 'bin')
+        File signer = new File(tools, 'lib/apksigner.jar')
+        File unsigned = new File(temporaryDir, 'unsigned.apk')
+        File aligned = new File(temporaryDir, 'aligned.apk')
+        File apk = outputDirectory.file('install-fixture.apk').get().asFile
+        apk.parentFile.mkdirs()
+        execOperations.exec { commandLine new File(tools, "aapt2$ext"), 'link', '-o', unsigned,
+                '-I', androidJar.get().asFile, '--manifest', fixtureManifest.get().asFile }
+        execOperations.exec { commandLine new File(tools, "zipalign$ext"), '-f', '4', unsigned, aligned }
+
+        File key = new File(temporaryDir, "fixture-${UUID.randomUUID()}.p12")
+        String password = UUID.randomUUID().toString()
+        try {
+            execOperations.exec {
+                environment 'FIXTURE_KEY_PASS', password
+                commandLine new File(jdkBin, "keytool$ext"), '-genkeypair', '-noprompt', '-storetype', 'PKCS12',
+                        '-keystore', key, '-storepass:env', 'FIXTURE_KEY_PASS', '-keypass:env', 'FIXTURE_KEY_PASS',
+                        '-alias', 'fixture', '-keyalg', 'RSA', '-keysize', '2048', '-validity', '3650',
+                        '-dname', 'CN=Install Test Fixture'
+            }
+            execOperations.exec {
+                environment 'FIXTURE_KEY_PASS', password
+                commandLine new File(jdkBin, "java$ext"), '-jar', signer, 'sign', '--ks', key,
+                        '--ks-pass', 'env:FIXTURE_KEY_PASS', '--key-pass', 'env:FIXTURE_KEY_PASS',
+                        '--v2-signing-enabled', 'true', '--v4-signing-enabled', 'false', '--out', apk, aligned
+            }
+            execOperations.exec { commandLine new File(jdkBin, "java$ext"), '-jar', signer, 'verify', apk }
+        } finally {
+            java.nio.file.Files.deleteIfExists(key.toPath())
+        }
+    }
+}
+
+def sdk = androidComponents.sdkComponents
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    String name = variant.name.capitalize()
+    def nativeTask = { String taskName, String path, String asset ->
+        tasks.register(taskName, BuildElfAssets) {
+            sourceFile.set(layout.projectDirectory.file(path))
+            assetName.set(asset)
+            apiLevel.set(variant.minSdk.apiLevel)
+            ndkDirectory.set(sdk.ndkDirectory)
+        }
+    }
+    def launcher = nativeTask("build${name}ElfLauncher", 'src/main/cpp/executable-launcher.c', 'executable-launcher')
+    variant.sources.assets.addGeneratedSourceDirectory(launcher) { it.outputDirectory }
+
+    def tests = variant.androidTest
+    if (tests != null) {
+        def probe = nativeTask("build${name}ElfProbe", 'src/androidTest/cpp/executable-probe.c', 'executable-probe')
+        tests.sources.assets.addGeneratedSourceDirectory(probe) { it.outputDirectory }
+        def version = android.buildToolsVersion
+        def fixture = tasks.register("build${name}InstallFixture", BuildInstallFixture) {
+            fixtureManifest.set(layout.projectDirectory.file('src/androidTest/install-fixture/AndroidManifest.xml'))
+            androidJar.set(sdk.bootClasspath.map { files -> files.find { it.asFile.name == 'android.jar' } })
+            buildToolsDirectory.set(sdk.sdkDirectory.map { it.dir("build-tools/$version") })
+        }
+        tests.sources.assets.addGeneratedSourceDirectory(fixture) { it.outputDirectory }
+    }
+}

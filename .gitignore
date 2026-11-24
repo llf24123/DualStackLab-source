@@ -1,0 +1,44 @@
+# Local build output and caches
+.gradle/
+**/build/
+.idea/
+*.iml
+.cxx/
+.externalNativeBuild/
+
+# Machine-specific configuration and signing credentials
+local.properties
+application-id.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pk8
+*.pem
+*.der
+*.cer
+*.crt
+*.apk
+*.apk.*
+*.apks
+*.apks.*
+*.apkm
+*.xapk
+*.aab
+*.aab.*
+*.idsig
+*.sha256
+.env
+.env.*
+
+# Generated deliverables, investigation files and crash logs
+/outputs/
+/work/
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+
+# OS metadata
+.DS_Store
+Thumbs.db
