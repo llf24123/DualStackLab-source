@@ -158,6 +158,7 @@ final class ArchiveFormats {
     }
 
     static void extract(File file, String prefix, File output, boolean selected) throws IOException {
+        Tasks.Progress.budget("解压文件", -1);
         if(single(file)){extractStream(file,prefix,output);return;}
         if (sevenZ(file)) { extractSevenZ(file, prefix, output, selected); return; }
         String requested = selection(prefix);
@@ -328,6 +329,12 @@ final class ArchiveFormats {
         try {
             directories(output.toPath(), created);
             try (SevenZFile archive = openSevenZ(file)) {
+                long expected = 0;
+                for (SevenZArchiveEntry header : archive.getEntries()) {
+                    Tasks.Progress.check();
+                    if (!header.isDirectory() && ArchiveOps.matchesSelection(sevenPath(header), requested)) expected = ArchiveOps.addSize(expected, header.getSize());
+                }
+                Tasks.Progress.budget("解压文件", expected);
                 SevenZArchiveEntry item;
                 while ((item = archive.getNextEntry()) != null) {
                     String path = sevenPath(item);

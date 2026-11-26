@@ -48,7 +48,7 @@ final class ApkDialog {
             dialog.getButton(-1).setEnabled(false);
             dialog.getButton(-1).setOnClickListener(x -> {
                 if(ready[0]==null)return;
-                handedOff[0]=true;dialog.dismiss();(RootAccess.known()?silent:install).accept(ready[0]);
+                handedOff[0]=true;dialog.dismiss();silent.accept(ready[0]);
             });
             dialog.getButton(-3).setOnClickListener(x -> MaterialDialogs.builder(activity).setTitle("APK 功能")
                     .setItems(ready[0]==null?new String[]{"APK 编辑工具", "复制全部信息"}:new String[]{"APK 编辑工具", "复制全部信息", "系统安装"}, (d, which) -> {

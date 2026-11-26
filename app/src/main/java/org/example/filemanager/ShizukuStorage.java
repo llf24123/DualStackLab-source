@@ -39,7 +39,7 @@ final class ShizukuStorage {
         String error;
         Binding(Context context) {
             arguments = new Shizuku.UserServiceArgs(new ComponentName(context, ShizukuDataService.class))
-                    .daemon(false).processNameSuffix("android_data").tag("android-data").version(2);
+                    .daemon(false).processNameSuffix("android_data").tag("android-data").version(3);
         }
         void start() {
             synchronized (LOCK) { if (binding != this) return; }

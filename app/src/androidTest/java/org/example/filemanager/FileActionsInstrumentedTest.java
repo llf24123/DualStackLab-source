@@ -145,7 +145,7 @@ public class FileActionsInstrumentedTest {
         FileStore.Node partial = store.extract(List.of(entry), FileStore.local(work), "partial");
         assertEquals(List.of("provider.txt"), Arrays.asList(partial.file.list()));
     }
-    @Test public void failedExtractionCleansDestinationAndKeepsOriginals() throws Exception {
+    @Test public void unsafeArchivePublishesNoMembersAndKeepsOriginals() throws Exception {
         File zip = new File(work, "bad.zip");
         try (java.util.zip.ZipOutputStream out = new java.util.zip.ZipOutputStream(new FileOutputStream(zip))) {
             out.putNextEntry(new java.util.zip.ZipEntry("valid.txt")); out.write(65); out.closeEntry();
@@ -153,7 +153,10 @@ public class FileActionsInstrumentedTest {
         }
         try { store.extract(List.of(FileStore.local(zip)), FileStore.local(work), "failed"); fail("Zip slip"); }
         catch (IOException expected) { }
-        assertFalse(new File(work, "failed").exists()); assertTrue(zip.exists());
+        File output = new File(work, "failed");
+        assertTrue(output.isDirectory());
+        assertArrayEquals(new String[0], output.list());
+        assertTrue(zip.exists());
         assertFalse(new File(work, "escape.txt").exists());
     }
     @Test public void rootMoveAndPermissionChangePreserveInode() throws Exception {

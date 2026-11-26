@@ -3,11 +3,15 @@ package org.example.filemanager;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.HostKeyRepository;
 import com.jcraft.jsch.JSch;
+import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
+import com.jcraft.jsch.SftpException;
 import jcifs.config.PropertyConfiguration;
 import jcifs.context.BaseContext;
 import jcifs.smb.NtlmPasswordAuthenticator;
 import jcifs.smb.SmbFile;
+import jcifs.smb.SmbException;
+import jcifs.smb.NtStatus;
 import okhttp3.*;
 import org.xmlpull.v1.XmlPullParser;
 
@@ -23,19 +27,52 @@ interface RemoteStorage extends AutoCloseable {
     record Entry(String name, boolean directory, long size) { }
     List<Entry> list(List<String> path) throws Exception;
     void download(List<String> path, OutputStream target) throws Exception;
-    void upload(List<String> path, InputStream source) throws Exception;
+    default void upload(List<String> path, InputStream source) throws Exception { upload(path, source, -1); }
+    void upload(List<String> path, InputStream source, long size) throws Exception;
+    void mkdir(List<String> path) throws Exception;
+    void renameFile(List<String> path, List<String> target) throws Exception;
+    void deleteFile(List<String> path) throws Exception;
     @Override default void close() throws Exception { }
 
-    static RemoteStorage connect(String address, String user, String password, String fingerprint) throws Exception {
-        URI endpoint = new URI(address.trim());
-        if (endpoint.getHost() == null || endpoint.getUserInfo() != null || endpoint.getQuery() != null || endpoint.getFragment() != null)
+    static String connectionScheme(String scheme) {
+        String normalized = scheme.toLowerCase(Locale.ROOT);
+        return normalized.equals("ssh") ? "sftp" : normalized;
+    }
+    static URI endpoint(String address) throws IOException {
+        String value = address.trim();
+        if (value.isEmpty()) throw new IOException("请输入服务器地址");
+        URI endpoint;
+        try { endpoint = new URI(value.contains("://") ? value : "sftp://" + value).parseServerAuthority(); }
+        catch (java.net.URISyntaxException error) { throw new IOException("服务器地址格式无效，路径中的空格请写成 %20"); }
+        if (endpoint.getHost() == null || endpoint.getUserInfo() != null || endpoint.getQuery() != null || endpoint.getFragment() != null
+                || endpoint.getPort() == 0 || endpoint.getPort() > 65535)
             throw new IOException("请输入完整服务器地址，账号和密码请分别填写");
+        String scheme = connectionScheme(endpoint.getScheme());
+        return scheme.equals(endpoint.getScheme()) ? endpoint
+                : URI.create(scheme + endpoint.toASCIIString().substring(endpoint.getScheme().length()));
+    }
+    static RemoteStorage connect(String address, String user, String password, String fingerprint) throws Exception {
+        return connect(address, user, password, fingerprint, null);
+    }
+    static RemoteStorage connect(String address, String user, String password, String fingerprint, byte[] key) throws Exception {
+        URI endpoint = endpoint(address);
         return switch (endpoint.getScheme().toLowerCase(Locale.ROOT)) {
             case "https" -> new Dav(endpoint, user, password);
-            case "sftp" -> new Sftp(endpoint, user, password, fingerprint);
+            case "sftp" -> new Sftp(endpoint, user, password, fingerprint, key);
             case "smb" -> new Smb(endpoint, user, password);
-            default -> throw new IOException("支持 https://、sftp:// 和 smb:// 地址");
+            case "ftp" -> new RemoteFtp(endpoint, user, password);
+            default -> throw new IOException("支持 FTP、SSH（SFTP）、HTTPS WebDAV 和 SMB");
         };
+    }
+
+    final class SshServiceDetected extends IOException {
+        SshServiceDetected(int port) {
+            super("端口 " + port + " 提供 SSH 服务，无法用 FTP 连接。请选择 SSH（SFTP）或填写实际的 FTP 端口。");
+        }
+    }
+    final class HostKeyRequired extends IOException {
+        final String fingerprint;
+        HostKeyRequired(String fingerprint) { super("请核对 SFTP 服务器的主机指纹"); this.fingerprint = fingerprint; }
     }
 
     static String component(String value) throws IOException {
@@ -86,7 +123,10 @@ interface RemoteStorage extends AutoCloseable {
             if (!result.isSuccessful()) {
                 int code = result.code();
                 result.close();
+                if (code == 401 || code == 403) throw new IOException("WebDAV 账号验证失败或没有权限（HTTP " + code + "）");
+                if (code == 404) throw new IOException("未找到 WebDAV 路径，请检查服务器地址和共享目录（HTTP 404）");
                 if (code == 409 || code == 412) throw new IOException("目标已存在或目录已变化");
+                if (code >= 300 && code < 400) throw new IOException("WebDAV 返回跳转，请填写最终的 HTTPS WebDAV 地址（HTTP " + code + "）");
                 throw new IOException("WebDAV 请求失败（HTTP " + code + "）");
             }
             return result;
@@ -96,7 +136,9 @@ interface RemoteStorage extends AutoCloseable {
             String query = "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/><d:getcontentlength/></d:prop></d:propfind>";
             try (Response response = execute(request(folder).header("Depth", "1")
                     .method("PROPFIND", RequestBody.create(query, XML)).build())) {
+                if (response.code() != 207) throw new IOException("该地址未返回 WebDAV 目录，请填写 WebDAV 服务路径");
                 XmlPullParser parser = android.util.Xml.newPullParser();
+                parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true);
                 parser.setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false);
                 byte[] body = FileStore.readBytes(Objects.requireNonNull(response.body()).byteStream(), 8 * 1024 * 1024 + 1);
                 if (body.length > 8 * 1024 * 1024) throw new IOException("WebDAV 目录结果超过 8 MiB");
@@ -105,19 +147,34 @@ interface RemoteStorage extends AutoCloseable {
                 String href = null;
                 long size = -1;
                 boolean directory = false;
+                boolean inPropstat = false, propDirectory = false;
+                long propSize = -1;
+                int status = 0, propStatus = 0;
                 for (int event = parser.next(); event != XmlPullParser.END_DOCUMENT; event = parser.next()) {
                     Tasks.Progress.check();
+                    if (!"DAV:".equals(parser.getNamespace())) continue;
                     if (event == XmlPullParser.START_TAG) {
                         switch (parser.getName()) {
-                            case "response" -> { href = null; size = -1; directory = false; }
-                            case "href" -> href = parser.nextText();
-                            case "collection" -> directory = true;
+                            case "response" -> { href = null; size = -1; directory = false; status = 0; }
+                            case "href" -> { if (href == null && !inPropstat) href = parser.nextText().trim(); }
+                            case "propstat" -> { inPropstat = true; propDirectory = false; propSize = -1; propStatus = 0; }
+                            case "status" -> { if (inPropstat) propStatus = statusCode(parser.nextText()); else status = statusCode(parser.nextText()); }
+                            case "collection" -> { if (inPropstat) propDirectory = true; else directory = true; }
                             case "getcontentlength" -> {
-                                try { size = Long.parseLong(parser.nextText()); }
-                                catch (NumberFormatException ignored) { size = -1; }
+                                long value;
+                                try { value = Math.max(-1, Long.parseLong(parser.nextText().trim())); }
+                                catch (NumberFormatException ignored) { value = -1; }
+                                if (inPropstat) propSize = value; else size = value;
                             }
                         }
+                    } else if (event == XmlPullParser.END_TAG && "propstat".equals(parser.getName())) {
+                        if (propStatus >= 200 && propStatus < 300) {
+                            directory |= propDirectory;
+                            if (propSize >= 0) size = propSize;
+                        }
+                        inPropstat = false;
                     } else if (event == XmlPullParser.END_TAG && "response".equals(parser.getName()) && href != null) {
+                        if (status != 0 && (status < 200 || status >= 300)) continue;
                         HttpUrl item = folder.resolve(href);
                         if (item == null || !item.scheme().equals(folder.scheme()) || !item.host().equals(folder.host())
                                 || item.port() != folder.port() || !item.username().isEmpty() || !item.password().isEmpty()) continue;
@@ -128,25 +185,46 @@ interface RemoteStorage extends AutoCloseable {
                         if (itemPath.size() != prefix.size() + 1 || !itemPath.subList(0, prefix.size()).equals(prefix)) continue;
                         try {
                             String name = component(itemPath.get(itemPath.size() - 1));
-                            entries.putIfAbsent(name, new Entry(name, directory, size));
+                            entries.putIfAbsent(name, new Entry(name, directory, directory ? -1 : size));
                         } catch (IOException invalidName) { /* Unrepresentable name cannot be a target. */ }
                     }
                 }
                 return sorted(new ArrayList<>(entries.values()));
             }
         }
+        private static int statusCode(String line) {
+            String[] parts = line.trim().split("\\s+", 3);
+            try { return parts.length >= 2 ? Integer.parseInt(parts[1]) : -1; }
+            catch (NumberFormatException invalid) { return -1; }
+        }
         @Override public void download(List<String> path, OutputStream target) throws IOException {
             try (Response response = execute(request(url(path, false)).get().build())) {
                 FileStore.pump(Objects.requireNonNull(response.body()).byteStream(), target);
             }
         }
-        @Override public void upload(List<String> path, InputStream source) throws IOException {
+        @Override public void upload(List<String> path, InputStream source, long size) throws IOException {
             RequestBody content = new RequestBody() {
                 @Override public MediaType contentType() { return DATA; }
+                @Override public long contentLength() { return size; }
                 @Override public boolean isOneShot() { return true; }
-                @Override public void writeTo(okio.BufferedSink sink) throws IOException { FileStore.pump(source, sink.outputStream()); }
+                @Override public void writeTo(okio.BufferedSink sink) throws IOException { FileStore.pump(source, sink.outputStream(), size); }
             };
-            try (Response ignored = execute(request(url(path, false)).header("If-None-Match", "*").put(content).build())) { }
+            mutate(request(url(path, false)).header("If-None-Match", "*").put(content).build());
+        }
+        private void mutate(Request request) throws IOException {
+            try (Response response = execute(request)) {
+                if (response.code() == 202 || response.code() == 207) throw new IOException("服务器未确认操作全部完成，请刷新目录");
+            }
+        }
+        @Override public void mkdir(List<String> path) throws IOException {
+            mutate(request(url(path, true)).method("MKCOL", null).build());
+        }
+        @Override public void renameFile(List<String> path, List<String> target) throws IOException {
+            mutate(request(url(path, false)).header("Destination", url(target, false).toString())
+                    .header("Overwrite", "F").method("MOVE", null).build());
+        }
+        @Override public void deleteFile(List<String> path) throws IOException {
+            mutate(request(url(path, false)).delete().build());
         }
         @Override public void close() { client.dispatcher().cancelAll(); client.connectionPool().evictAll(); }
     }
@@ -155,17 +233,20 @@ interface RemoteStorage extends AutoCloseable {
         private final Session session;
         private final ChannelSftp channel;
         private final String root;
-        Sftp(URI endpoint, String user, String password, String fingerprint) throws Exception {
-            if (user.isBlank() || !fingerprint.trim().matches("SHA256:[A-Za-z0-9+/]{43}=?"))
-                throw new IOException("请填写 SFTP 用户名与可信的 SHA256 主机指纹");
+        Sftp(URI endpoint, String user, String password, String fingerprint, byte[] keyFile) throws Exception {
+            if (user.isBlank()) throw new IOException("请填写 SSH 用户名");
             String expected = fingerprint.trim().replaceFirst("=$", "");
+            if (!expected.isEmpty() && !expected.matches("SHA256:[A-Za-z0-9+/]{43}"))
+                throw new IOException("SFTP 主机指纹格式应为 SHA256:…");
+            String[] observed = {null};
             JSch ssh = new JSch();
             ssh.setHostKeyRepository(new HostKeyRepository() {
                 @Override public int check(String host, byte[] key) {
                     try {
                         String actual = "SHA256:" + android.util.Base64.encodeToString(MessageDigest.getInstance("SHA-256").digest(key),
                                 android.util.Base64.NO_PADDING | android.util.Base64.NO_WRAP);
-                        return expected.equals(actual) ? OK : CHANGED;
+                        observed[0] = actual;
+                        return expected.isEmpty() ? NOT_INCLUDED : expected.equals(actual) ? OK : CHANGED;
                     } catch (java.security.NoSuchAlgorithmException impossible) { return CHANGED; }
                 }
                 @Override public void add(com.jcraft.jsch.HostKey key, com.jcraft.jsch.UserInfo info) { }
@@ -176,16 +257,48 @@ interface RemoteStorage extends AutoCloseable {
                 @Override public com.jcraft.jsch.HostKey[] getHostKey(String host, String type) { return getHostKey(); }
             });
             session = ssh.getSession(user, endpoint.getHost(), endpoint.getPort() < 0 ? 22 : endpoint.getPort());
-            session.setPassword(password);
             session.setConfig("StrictHostKeyChecking", "yes");
-            session.setConfig("PreferredAuthentications", "password,keyboard-interactive");
+            session.setConfig("PreferredAuthentications", keyFile == null ? "password,keyboard-interactive" : "publickey");
             try {
-                session.connect(10_000);
+                if (keyFile == null) {
+                    session.setPassword(password);
+                } else {
+                    byte[] passphrase = password.isEmpty() ? null : password.getBytes(StandardCharsets.UTF_8);
+                    try { ssh.addIdentity("selected-key", keyFile, null, passphrase); }
+                    catch (JSchException error) { throw new IOException("无法读取 SSH 私钥，请检查私钥格式和口令", error); }
+                    finally { if (passphrase != null) Arrays.fill(passphrase, (byte) 0); }
+                }
+                try { session.connect(10_000); }
+                catch (JSchException error) { throw loginFailure(error, keyFile != null); }
+                session.setServerAliveInterval(15_000);
+                session.setServerAliveCountMax(2);
                 session.setTimeout(15_000);
                 channel = (ChannelSftp) session.openChannel("sftp");
-                channel.connect(10_000);
+                try { channel.connect(10_000); }
+                catch (JSchException error) {
+                    throw new IOException("SSH 登录成功，但无法打开 SFTP 文件服务。请检查服务器是否为此账号启用了 SFTP。", error);
+                }
                 root = channel.realpath(endpoint.getPath().isEmpty() ? "." : endpoint.getPath());
-            } catch (Exception error) { session.disconnect(); throw error; }
+            } catch (Exception error) {
+                session.disconnect();
+                if (error instanceof JSchException && observed[0] != null && !expected.equals(observed[0])) {
+                    if (expected.isEmpty()) throw new HostKeyRequired(observed[0]);
+                    throw new JSchException("SFTP 主机指纹与记录不一致，请通过服务器控制台核对", error);
+                }
+                throw error;
+            } finally { try { ssh.removeAllIdentity(); } catch (JSchException ignored) { } }
+        }
+        private static IOException loginFailure(JSchException error, boolean usingKey) throws JSchException {
+            String message = Objects.toString(error.getMessage(), "");
+            if (!message.startsWith("Auth fail")) throw error;
+            String prefix = "Auth fail for methods '";
+            if (!usingKey && message.startsWith(prefix) && message.endsWith("'")) {
+                List<String> methods = Arrays.asList(message.substring(prefix.length(), message.length() - 1).split(","));
+                if (methods.equals(List.of("publickey")))
+                    return new IOException("该 SSH 账号只允许公钥登录。请选择私钥，或请服务器管理员为账号配置密码登录。", error);
+            }
+            return new IOException(usingKey ? "SSH 私钥登录失败，请核对用户名、私钥口令及服务器是否已授权对应公钥。"
+                    : "SSH 密码登录失败，请核对用户名、密码及服务器是否允许密码登录。", error);
         }
         private String path(List<String> parts) throws IOException {
             StringBuilder value = new StringBuilder(root.endsWith("/") ? root.substring(0, root.length() - 1) : root);
@@ -208,57 +321,90 @@ interface RemoteStorage extends AutoCloseable {
             String remote = globSafe(path(path));
             try (InputStream input = channel.get(remote)) { FileStore.pump(input, target); }
         }
-        @Override public void upload(List<String> path, InputStream source) throws Exception {
+        private void requireAbsent(String target) throws Exception {
+            try {
+                channel.lstat(target);
+                throw new IOException("同名远程文件已存在");
+            } catch (SftpException missing) {
+                if (missing.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) throw missing;
+            }
+        }
+        private boolean linkOrRename(String source, String target) throws Exception {
+            Tasks.Progress.check();
+            requireAbsent(target);
+            if ("1".equals(channel.getExtension("posix-rename@openssh.com"))) {
+                if (!"1".equals(channel.getExtension("hardlink@openssh.com")))
+                    throw new IOException("此 SFTP 服务器不支持安全发布同名文件");
+                channel.hardlink(source, target);
+                return true;
+            }
+            channel.rename(source, target);
+            return false;
+        }
+        @Override public void upload(List<String> path, InputStream source, long size) throws Exception {
             String target = globSafe(path(path));
+            requireAbsent(target);
             String temporaryName = ".dualstack-upload-" + UUID.randomUUID();
             List<String> parent = path.subList(0, path.size() - 1);
             String temporary = globSafe(path(child(parent, temporaryName)));
             try {
-                try (OutputStream output = channel.put(temporary)) { FileStore.pump(source, output); }
-                try {
-                    channel.lstat(target);
-                    throw new IOException("同名远程文件已存在");
-                } catch (com.jcraft.jsch.SftpException missing) {
-                    if (missing.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) throw missing;
-                }
-                // JSch prefers the POSIX extension, which can replace a newly created target.
-                if ("1".equals(channel.getExtension("posix-rename@openssh.com"))) {
-                    if (!"1".equals(channel.getExtension("hardlink@openssh.com")))
-                        throw new IOException("此 SFTP 服务器无法保证上传时不覆盖同名文件");
-                    channel.hardlink(temporary, target);
-                } else {
-                    channel.rename(temporary, target);
-                }
-            } finally { try { channel.rm(temporary); } catch (com.jcraft.jsch.SftpException ignored) { } }
+                try (OutputStream output = channel.put(temporary)) { FileStore.pump(source, output, size); }
+                linkOrRename(temporary, target);
+            } finally { try { channel.rm(temporary); } catch (SftpException ignored) { } }
+        }
+        @Override public void mkdir(List<String> path) throws Exception { channel.mkdir(path(path)); }
+        @Override public void renameFile(List<String> path, List<String> target) throws Exception {
+            String before = globSafe(path(path));
+            if (!channel.lstat(before).isReg()) throw new IOException("只能重命名普通文件");
+            if (linkOrRename(before, globSafe(path(target)))) {
+                try { channel.rm(before); }
+                catch (SftpException error) { throw new IOException("新名称已创建，原文件未能移除，请刷新目录", error); }
+            }
+        }
+        @Override public void deleteFile(List<String> path) throws Exception {
+            String target = globSafe(path(path));
+            if (!channel.lstat(target).isReg()) throw new IOException("只能删除普通文件");
+            channel.rm(target);
         }
         @Override public void close() { channel.disconnect(); session.disconnect(); }
     }
 
     final class Smb implements RemoteStorage {
+        private record FileVersion(long size, long created, long modified) { }
         private final jcifs.CIFSContext context;
-        private final String base;
+        private final String hostAddress;
+        private final List<String> base;
         Smb(URI endpoint, String user, String password) throws Exception {
+            hostAddress = "smb://" + endpoint.getRawAuthority() + "/";
+            List<String> root = new ArrayList<>();
+            for (String name : endpoint.getRawPath().split("/")) {
+                if (!name.isEmpty()) root.add(component(android.net.Uri.decode(name)));
+            }
+            base = List.copyOf(root);
             Properties properties = new Properties();
             properties.setProperty("jcifs.smb.client.minVersion", "SMB202");
             properties.setProperty("jcifs.smb.client.maxVersion", "SMB311");
             properties.setProperty("jcifs.smb.client.connTimeout", "10000");
             properties.setProperty("jcifs.smb.client.soTimeout", "15000");
             properties.setProperty("jcifs.smb.client.responseTimeout", "15000");
+            // Some SMB2 servers cannot decode a compound open/close when the open returns an error.
+            properties.setProperty("jcifs.smb.client.disallowCompound",
+                    "Smb2SessionSetupRequest,Smb2TreeConnectRequest,Smb2CreateRequest,Smb2CloseRequest,Smb2SetInfoRequest");
             BaseContext common = new BaseContext(new PropertyConfiguration(properties));
             String[] account = user.split("\\\\", 2);
             context = common.withCredentials(new NtlmPasswordAuthenticator(account.length == 2 ? account[0] : "",
                     account[account.length - 1], password));
-            String address = endpoint.toASCIIString();
-            base = address.endsWith("/") ? address : address + "/";
         }
         private SmbFile file(List<String> path, boolean directory) throws Exception {
-            StringBuilder address = new StringBuilder(base);
-            for (int i = 0; i < path.size(); i++) {
-                if (i > 0) address.append('/');
-                address.append(android.net.Uri.encode(component(path.get(i))));
+            List<String> parts = new ArrayList<>(base);
+            for (String segment : path) parts.add(component(segment));
+            if (parts.isEmpty()) return new SmbFile(hostAddress, context);
+            String relative = String.join("/", parts) + (directory ? "/" : "");
+            // jcifs-ng treats segments passed in a full URL as literal. Resolve from the
+            // parent so spaces, Unicode, percent signs and hashes reach the SMB path intact.
+            try (SmbFile host = new SmbFile(hostAddress, context)) {
+                return new SmbFile(host, relative);
             }
-            if (directory && !path.isEmpty()) address.append('/');
-            return new SmbFile(address.toString(), context);
         }
         @Override public List<Entry> list(List<String> path) throws Exception {
             List<Entry> result = new ArrayList<>();
@@ -276,16 +422,58 @@ interface RemoteStorage extends AutoCloseable {
         @Override public void download(List<String> path, OutputStream target) throws Exception {
             try (SmbFile item = file(path, false); InputStream input = item.openInputStream()) { FileStore.pump(input, target); }
         }
-        @Override public void upload(List<String> path, InputStream source) throws Exception {
+        @Override public void upload(List<String> path, InputStream source, long size) throws Exception {
             List<String> parent = path.subList(0, path.size() - 1);
+            List<String> staged = child(parent, ".dualstack-upload-" + UUID.randomUUID());
             try (SmbFile target = file(path, false);
-                 SmbFile temporary = file(child(parent, ".dualstack-upload-" + UUID.randomUUID()), false)) {
+                 SmbFile temporary = file(staged, false)) {
                 if (target.exists()) throw new IOException("同名远程文件已存在");
+                temporary.createNewFile();
                 try {
-                    temporary.createNewFile();
-                    try (OutputStream out = temporary.openOutputStream()) { FileStore.pump(source, out); }
-                    temporary.renameTo(target, false);
-                } finally { if (temporary.exists()) temporary.delete(); }
+                    try (OutputStream out = temporary.openOutputStream()) { FileStore.pump(source, out, size); }
+                    Tasks.Progress.check();
+                    rename(staged, path, temporary, target);
+                } catch (Exception error) {
+                    try { if (temporary.exists()) temporary.delete(); }
+                    catch (Exception cleanup) { error.addSuppressed(cleanup); }
+                    throw error;
+                }
+            }
+        }
+        @Override public void mkdir(List<String> path) throws Exception {
+            try (SmbFile folder = file(path, true)) { folder.mkdir(); }
+        }
+        @Override public void renameFile(List<String> path, List<String> target) throws Exception {
+            try (SmbFile source = file(path, false); SmbFile destination = file(target, false)) {
+                if (!source.isFile()) throw new IOException("只能重命名普通文件");
+                if (destination.exists()) throw new IOException("同名远程文件已存在");
+                rename(path, target, source, destination);
+            }
+        }
+        private FileVersion version(List<String> path) throws Exception {
+            try (SmbFile item = file(path, false)) {
+                return item.isFile() ? new FileVersion(item.length(), item.createTime(), item.lastModified()) : null;
+            }
+        }
+        private void rename(List<String> before, List<String> after, SmbFile source, SmbFile target) throws Exception {
+            FileVersion original = version(before);
+            if (original == null) throw new IOException("服务器上的来源文件已变化，请刷新目录");
+            try { source.renameTo(target, false); }
+            catch (SmbException error) {
+                // An SMB server can apply SET_INFO successfully, then report the old name
+                // as missing when closing its handle. Confirm the outcome with fresh handles.
+                if (error.getNtStatus() != NtStatus.NT_STATUS_OBJECT_NAME_NOT_FOUND
+                        && error.getNtStatus() != NtStatus.NT_STATUS_NO_SUCH_FILE) throw error;
+                try (SmbFile old = file(before, false)) {
+                    if (!old.exists() && original.equals(version(after))) return;
+                } catch (Exception verify) { error.addSuppressed(verify); }
+                throw error;
+            }
+        }
+        @Override public void deleteFile(List<String> path) throws Exception {
+            try (SmbFile item = file(path, false)) {
+                if (!item.isFile()) throw new IOException("只能删除普通文件");
+                item.delete();
             }
         }
         @Override public void close() throws Exception { context.close(); }

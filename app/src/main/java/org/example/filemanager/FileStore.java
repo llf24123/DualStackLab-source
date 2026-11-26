@@ -208,10 +208,13 @@ final class FileStore {
         } else if (parent.uri != null) {
             Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(parent.uri,
                     DocumentsContract.getDocumentId(parent.uri));
-            try (Cursor c = context.getContentResolver().query(children, new String[]{
+            String[] projection = {
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                     DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE,
-                    DocumentsContract.Document.COLUMN_LAST_MODIFIED}, null, null, null, signal)) {
+                    DocumentsContract.Document.COLUMN_LAST_MODIFIED};
+            try (Cursor c = DataDocumentsProvider.owns(parent.uri)
+                    ? DataDocumentsProvider.children(context, DocumentsContract.getDocumentId(parent.uri), projection, signal)
+                    : context.getContentResolver().query(children, projection, null, null, null, signal)) {
                 if (c == null) throw new IOException("存储提供方没有返回目录");
                 while (c.moveToNext()) {
                     if (signal != null) signal.throwIfCanceled();
@@ -635,19 +638,24 @@ final class FileStore {
     }
     void validateCopy(Node source, Node target) throws IOException { checkCopy(source, target); }
     List<Node> executePlan(TransferPlan plan, boolean move) throws IOException {
+        Tasks.Progress.plan(plan.items.stream().filter(item -> !plan.published.containsKey(item.source().key())).map(TransferPlan.Item::source).toList(), move ? "移动文件" : "复制文件");
         try (ArchiveReads reads = new ArchiveReads()) {
             for (TransferPlan.Item item : plan.items) {
                 if (plan.settled.contains(item.source().key())) continue;
                 if (move) checkRemoval(item.source());
                 checkCopy(item.source(), item.parent());
                 if (plan.published.containsKey(item.source().key())) {
-                    OutputVersion version = plan.versions.get(item.source().key());
-                    OutputVersion current = outputVersion(plan.published.get(item.source().key()));
-                    if (version == null && contentSignature(item.source(), new HashSet<>()).equals(current.content)) {
-                        plan.versions.put(item.source().key(), current); version = current;
+                    // Member cleanup validates each remaining file against its target. The source
+                    // directory may already be partly consumed, so it cannot be hashed as a whole.
+                    if (!plan.moveMembers.containsKey(item.source().key())) {
+                        OutputVersion version = plan.versions.get(item.source().key());
+                        OutputVersion current = outputVersion(plan.published.get(item.source().key()));
+                        if (version == null && contentSignature(item.source(), new HashSet<>()).equals(current.content)) {
+                            plan.versions.put(item.source().key(), current); version = current;
+                        }
+                        if (version == null || !version.equals(current))
+                            throw new IOException("已写入的文件发生变化，请检查后重新操作：" + item.source().name);
                     }
-                    if (version == null || !version.equals(current))
-                        throw new IOException("已写入的文件发生变化，请检查后重新操作：" + item.source().name);
                 } else if (item.existing() != null && !Objects.equals(item.expected(), identity(item.existing())))
                     throw new IOException("目标在确认后发生变化，请重新选择：" + item.existing().name);
                 if (move && item.source().container != null && !plan.removedArchives.contains(item.source().container.key())) {
@@ -661,7 +669,12 @@ final class FileStore {
             for (TransferPlan.Item item : plan.items) {
                 if (plan.published.containsKey(item.source().key())) continue;
                 if (item.parent().container != null) { targetArchives.computeIfAbsent(item.parent().container.key(), k -> new ArrayList<>()).add(item); continue; }
-                Node output = copy(item.source(), item.parent(), move && item.source().container == null, names, item.policy(), item.existing(), item.expected());
+                Node output = copy(item.source(), item.parent(), move && item.source().container == null, names, item.policy(), item.existing(), item.expected(), null, node -> plan.retainedSourceDirectories++,
+                        (published, members) -> {
+                            // Preserve the completed copy before source cleanup can fail or be cancelled.
+                            plan.published.put(item.source().key(), published);
+                            plan.moveMembers.put(item.source().key(), members);
+                        });
                 if (output != null) {
                     plan.published.put(item.source().key(), output);
                     if (move && item.source().container != null) plan.versions.put(item.source().key(), outputVersion(output));
@@ -671,7 +684,7 @@ final class FileStore {
             // Publication invalidates cached ZIP readers. Release them before replacing any archive.
             reads.close();
             for (List<TransferPlan.Item> group : targetArchives.values()) {
-                Map<String, Node> outputs = copyPlanIntoArchive(group, move);
+                Map<String, Node> outputs = copyPlanIntoArchive(group, move, plan);
                 // Same-archive publication already removed its sources atomically. Record that
                 // before any later verification can fail, so retries never re-copy those entries.
                 plan.published.putAll(outputs);
@@ -686,12 +699,17 @@ final class FileStore {
                 Map<String, List<Node>> removals = new LinkedHashMap<>();
                 for (TransferPlan.Item item : plan.items) {
                     Node source = item.source(); Node output = plan.published.get(source.key());
-                    boolean deferred = source.container != null || item.parent().container != null;
+                    MoveMembers members = plan.moveMembers.get(source.key());
+                    boolean deferred = source.container != null || item.parent().container != null || members != null;
                     if (!deferred || output == null || plan.settled.contains(source.key()) || plan.removedSources.contains(source.key()) || source.container != null && plan.removedArchives.contains(source.container.key())) continue;
                     OutputVersion version = plan.versions.get(source.key());
-                    if (!version.equals(outputVersion(output)) || !contentSignature(source, new HashSet<>()).equals(version.content))
+                    if (members == null && (!version.equals(outputVersion(output)) || !contentSignature(source, new HashSet<>()).equals(version.content)))
                         throw new IOException("移动输出或来源内容发生变化，来源保留：" + source.name);
-                    if (source.container == null) { delete(source); plan.removedSources.add(source.key()); plan.settled.add(source.key()); }
+                    if (source.container == null) {
+                        if (members == null) throw new IOException("缺少来源清理记录，请检查已复制的文件：" + source.name);
+                        members.remove(node -> plan.retainedSourceDirectories++);
+                        plan.removedSources.add(source.key()); plan.settled.add(source.key());
+                    }
                     else removals.computeIfAbsent(source.container.key(), k -> new ArrayList<>()).add(source);
                 }
                 for (List<Node> entries : removals.values()) {
@@ -727,7 +745,7 @@ final class FileStore {
             throw error;
         }
     }
-    private Map<String, Node> copyPlanIntoArchive(List<TransferPlan.Item> items, boolean move) throws IOException {
+    private Map<String, Node> copyPlanIntoArchive(List<TransferPlan.Item> items, boolean move, TransferPlan plan) throws IOException {
         Node container = items.get(0).parent().container;
         synchronized (archiveLock(container)) {
             String baseline = fingerprint(container);
@@ -746,7 +764,9 @@ final class FileStore {
                     }
                     String name = overwrite ? source.name : unique(used, source.name); used.add(name);
                     String entry = parent.entry + name + (source.directory ? "/" : "");
-                    archiveAdditions(source, entry, additions, staged, new HashSet<>());
+                    MoveMembers members = move && source.container == null ? new MoveMembers() : null;
+                    archiveAdditions(source, entry, additions, staged, new HashSet<>(), container, members);
+                    if (members != null) plan.moveMembers.put(source.key(), members);
                     if (move && source.container != null && source.container.key().equals(container.key())) removals.add(source.entry);
                     outputs.put(source.key(), archiveNode(container, entry, source.directory, source.size, source.modified));
                 }
@@ -768,6 +788,11 @@ final class FileStore {
     }
     List<Node> copyAll(Collection<Node> sources, Node parent, boolean move, ConflictPolicy conflicts,
                        Set<String> existingNames) throws IOException {
+        return copyAll(sources, parent, move, conflicts, existingNames, null);
+    }
+    List<Node> copyAll(Collection<Node> sources, Node parent, boolean move, ConflictPolicy conflicts,
+                       Set<String> existingNames, java.util.function.Consumer<Node> retained) throws IOException {
+        Tasks.Progress.plan(sources, move ? "移动文件" : "复制文件");
         existingNames = existingNames == null ? null : new HashSet<>(existingNames);
         try (ArchiveReads reads = move ? null : new ArchiveReads()) {
             Node first = null; boolean archiveSources = true;
@@ -784,13 +809,24 @@ final class FileStore {
             Map<String, Set<String>> names = new HashMap<>();
             if (existingNames != null) names.put(RootAccess.automatic(parent).key(), new HashSet<>(existingNames));
             List<Node> items = new ArrayList<>(sources), copied = new ArrayList<>();
+            TransferPlan recovery = move ? new TransferPlan() : null;
+            if (recovery != null) for (Node source : items) recovery.items.add(new TransferPlan.Item(source, parent, conflicts, null, null));
             for (int index = 0; index < items.size(); index++) {
                 Node source = items.get(index);
                 try {
-                    Node output = copy(source, parent, move, names, conflicts);
-                    if (output != null) copied.add(output);
+                    Node output = copy(source, parent, move, names, conflicts, null, null, null, retained, recovery == null ? null : (published, members) -> {
+                        recovery.published.put(source.key(), published); recovery.moveMembers.put(source.key(), members);
+                    });
+                    if (output != null) {
+                        copied.add(output);
+                        if (recovery != null) { recovery.published.put(source.key(), output); recovery.settled.add(source.key()); }
+                    }
                 }
                 catch (IOException | RuntimeException error) {
+                    if (recovery != null && recovery.moveMembers.containsKey(source.key())) {
+                        names.forEach((key, value) -> recovery.directoryNames.put(key, new HashSet<>(value)));
+                        throw new TransferPlan.Incomplete(recovery, error);
+                    }
                     if (!(error instanceof Tasks.CancelledException) && !copied.isEmpty())
                         throw new Tasks.PartialTransferException(copied, items.subList(index, items.size()), error);
                     throw error;
@@ -813,6 +849,17 @@ final class FileStore {
     }
     private Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names,
                       ConflictPolicy conflicts, Node knownTarget, String confirmedIdentity, MessageDigest digest) throws IOException {
+        return copy(source, parent, move, names, conflicts, knownTarget, confirmedIdentity, digest, null);
+    }
+    private Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names,
+                      ConflictPolicy conflicts, Node knownTarget, String confirmedIdentity, MessageDigest digest,
+                      java.util.function.Consumer<Node> retained) throws IOException {
+        return copy(source, parent, move, names, conflicts, knownTarget, confirmedIdentity, digest, retained, null);
+    }
+    private interface MovePublication { void published(Node output, MoveMembers members) throws IOException; }
+    private Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names,
+                      ConflictPolicy conflicts, Node knownTarget, String confirmedIdentity, MessageDigest digest,
+                      java.util.function.Consumer<Node> retained, MovePublication publication) throws IOException {
         Tasks.Progress.check();
         if (move) checkRemoval(source);
         source = RootAccess.automatic(source);
@@ -830,7 +877,8 @@ final class FileStore {
             boolean sameArchive = source.container != null && source.container.key().equals(parent.container.key());
             String sourceVersion = !move || sameArchive ? null : source.container == null ? identity(source) : fingerprint(source);
             String sourceContent = !move || sameArchive ? null : contentSignature(source, new HashSet<>());
-            List<Node> output = copyIntoArchive(List.of(source), parent, move && sameArchive, conflicts, used);
+            MoveMembers members = move && source.container == null ? new MoveMembers() : null;
+            List<Node> output = copyIntoArchive(List.of(source), parent, move && sameArchive, null, conflicts, used, members);
             if (move && !sameArchive && !output.isEmpty()) {
                 OutputVersion targetVersion = outputVersion(output.get(0));
                 if (!sourceContent.equals(targetVersion.content) || !sourceContent.equals(contentSignature(source, new HashSet<>())))
@@ -839,7 +887,10 @@ final class FileStore {
                 if (!sourceVersion.equals(current) || !targetVersion.equals(outputVersion(output.get(0))))
                     throw new IOException("移动输出或来源版本发生变化，来源保留");
                 if (source.container != null) removeArchiveEntries(source.container, List.of(source), sourceVersion);
-                else delete(source);
+                else {
+                    if (publication != null) publication.published(output.get(0), members);
+                    members.remove(retained);
+                }
             }
             return output.isEmpty() ? null : output.get(0);
         }
@@ -852,9 +903,21 @@ final class FileStore {
                 throw new IOException("目标在确认后发生变化，请重新选择：" + existing.name);
             if (source.directory || existing.directory) throw new IOException("只能覆盖同名普通文件：" + source.name);
             checkContainerOverwrite(source, existing);
-            if (move && source.key().equals(existing.key())) return existing;
+            if (sameStorageObject(source, existing)) return existing;
+            // A cloud/pipe provider may hide its physical identity. A local payload must never
+            // be truncated by opening an alias for writing. A move also cannot safely unlink it.
+            boolean opaqueTarget = source.container == null && (source.uri != null || existing.uri != null)
+                    && (storageObjectIdentity(source) == null || storageObjectIdentity(existing) == null);
+            if (opaqueTarget && move)
+                throw new IOException("提供方无法确认来源与目标是不同文件，请先另存一份");
             String sourceVersion = move ? fingerprint(source) : null;
             File staged = materialize(source);
+            if (opaqueTarget && staged.equals(source.file)) {
+                File snapshot = File.createTempFile("overwrite-", ".tmp", context.getCacheDir());
+                try { Files.copy(staged.toPath(), snapshot.toPath(), StandardCopyOption.REPLACE_EXISTING); }
+                catch (IOException | RuntimeException e) { Files.deleteIfExists(snapshot.toPath()); throw e; }
+                staged = snapshot;
+            }
             String outputVersion;
             try {
                 if (move) checkRevision(source, sourceVersion);
@@ -868,7 +931,11 @@ final class FileStore {
                 checkRevision(existing, outputVersion);
                 checkRevision(source, sourceVersion);
                 if (source.container != null) removeArchiveEntries(source.container, List.of(source), sourceVersion);
-                else delete(source);
+                else {
+                    MoveMembers members = new MoveMembers(); members.record(source, existing);
+                    if (publication != null) publication.published(existing, members);
+                    members.remove(retained);
+                }
             }
             FileTimes.copied(context,source,existing);
             return existing;
@@ -891,15 +958,20 @@ final class FileStore {
         }
         Node made = createAbsent(parent, name, source.directory);
         used.add(made.name);
+        MoveMembers members = move && source.container == null ? new MoveMembers() : null;
         CopyLedger ledger = new CopyLedger();
         try {
             ledger.record(made);
-            copyContent(source, made, new HashSet<>(), ledger, digest);
+            copyContent(source, made, new HashSet<>(), ledger, digest, members);
         } catch (IOException | RuntimeException e) {
             ledger.rollback(e);
             throw e;
         }
-        if (move) delete(source);
+        if (members != null) {
+            if (publication != null) publication.published(made, members);
+            members.remove(retained);
+        }
+        else if (move) delete(source);
         return made;
     }
     /** One private rebuild and one guarded publication for a target archive. */
@@ -915,6 +987,10 @@ final class FileStore {
     }
     private List<Node> copyIntoArchive(Collection<Node> sources, Node parent, boolean move, String expected,
                                        ConflictPolicy conflicts, Set<String> existingNames) throws IOException {
+        return copyIntoArchive(sources, parent, move, expected, conflicts, existingNames, null);
+    }
+    private List<Node> copyIntoArchive(Collection<Node> sources, Node parent, boolean move, String expected,
+                                       ConflictPolicy conflicts, Set<String> existingNames, MoveMembers members) throws IOException {
         synchronized (archiveLock(parent.container)) {
             String baseline = expected == null ? fingerprint(parent.container) : expected;
             checkRevision(parent.container, baseline);
@@ -942,7 +1018,7 @@ final class FileStore {
                     if (overwrite) checkContainerOverwrite(source, previous);
                     String name = overwrite ? source.name : unique(used, source.name); used.add(name);
                     String entry = parent.entry + name + (source.directory ? "/" : "");
-                    archiveAdditions(source, entry, additions, staged, new HashSet<>());
+                    archiveAdditions(source, entry, additions, staged, new HashSet<>(), parent.container, members);
                     if (move) removals.add(source.entry);
                     outputs.add(archiveNode(parent.container, entry, source.directory, source.size, source.modified));
                 }
@@ -962,6 +1038,7 @@ final class FileStore {
         }
     }
     void removeArchiveEntries(Node container, Collection<Node> entries, String expected) throws IOException {
+        Tasks.Progress.phase("重建归档");
         editArchive(container, null, null, Collections.emptyMap(), expected, archiveRemovals(container, entries));
     }
     private Set<String> archiveRemovals(Node container, Collection<Node> entries) throws IOException {
@@ -1141,6 +1218,7 @@ final class FileStore {
         return new OutputVersion(before, content);
     }
     String contentSignature(Node node, Set<String> seen) throws IOException {
+        Tasks.Progress.phase("校验文件");
         Tasks.Progress.check();
         if (!node.directory) try (InputStream input = read(node)) { return "file:" + digest(input); }
         if (!seen.add(node.key())) throw new IOException("目录包含循环引用");
@@ -1190,25 +1268,107 @@ final class FileStore {
         }
     }
     private void archiveAdditions(Node source, String entry, Map<String, File> additions, Map<Node, File> staged,
-                                  Set<String> seen) throws IOException {
+                                  Set<String> seen, Node container, MoveMembers members) throws IOException {
+        if (members != null) members.record(source, archiveNode(container, entry, source.directory, source.size, source.modified));
         Tasks.Progress.step(source.name);
         String key = source.file != null ? source.file.getCanonicalPath() : source.key();
         if (!seen.add(key)) throw new IOException("目录包含循环引用");
         if (source.directory) {
             additions.put(entry, null);
-            for (Node child : list(source)) archiveAdditions(child, entry + child.name + (child.directory ? "/" : ""), additions, staged, seen);
+            for (Node child : list(source)) archiveAdditions(child, entry + child.name + (child.directory ? "/" : ""), additions, staged, seen, container, members);
         } else {
             File payload = materialize(source); staged.put(source, payload); additions.put(entry, payload);
         }
         seen.remove(key);
     }
+    /** Files eligible for deletion come from the enumeration made for this copy. A content
+     * provider has no nonrecursive rmdir contract, so its empty source folders must be retained. */
+    final class MoveMembers {
+        private record Member(Node source, Node target, String version) { }
+        private final List<Member> entries = new ArrayList<>();
+        private final Set<String> completed = new HashSet<>();
+
+        void record(Node source, Node target) throws IOException {
+            if (source.container != null) throw new IOException("归档成员必须通过归档写回移除");
+            if (source.file != null && (source.root
+                    ? !RootDirectoryReader.stat(source.path(), "%f", false).matches(source.directory ? "4[0-9a-fA-F]{3}" : "8[0-9a-fA-F]{3}")
+                    : Files.isSymbolicLink(source.file.toPath())))
+                throw new IOException("跨存储移动不跟随符号链接：" + source.name);
+            entries.add(new Member(source, target, source.directory ? directoryIdentity(source) : identity(source)));
+        }
+        private String directoryIdentity(Node node) throws IOException {
+            if (node.uri != null) {
+                if (!document(node.uri).directory) throw new IOException("来源目录已改变：" + node.name);
+                return node.key();
+            }
+            if (node.root) return RootDirectoryReader.stat(node.path(), "%d:%i", false);
+            try {
+                var stat = android.system.Os.lstat(node.path());
+                if (!android.system.OsConstants.S_ISDIR(stat.st_mode)) throw new IOException("来源目录已改变：" + node.name);
+                return fileIdentity(stat);
+            } catch (android.system.ErrnoException error) { throw new IOException(error); }
+        }
+        void remove(java.util.function.Consumer<Node> retained) throws IOException {
+            Tasks.Progress.phase("删除来源");
+            for (int i = entries.size() - 1; i >= 0; i--) {
+                Member entry = entries.get(i);
+                Node source = entry.source;
+                if (completed.contains(source.key())) continue;
+                Tasks.Progress.check();
+                if (source.directory) {
+                    if (!entry.version.equals(directoryIdentity(source))) throw new IOException("来源目录已改变：" + source.name);
+                    if (source.uri != null) {
+                        // Never call deleteDocument on a directory: it can recursively delete a late arrival.
+                        if (retained != null) retained.accept(source);
+                    } else {
+                        try { removeSingleSource(source); }
+                        catch (java.nio.file.DirectoryNotEmptyException kept) {
+                            if (retained != null) retained.accept(source);
+                        }
+                    }
+                } else {
+                    // Re-read both ends before destructive cleanup (providers can silently truncate writes).
+                    if (!entry.version.equals(identity(source))
+                            || !contentSignature(source, new HashSet<>()).equals(contentSignature(entry.target, new HashSet<>()))
+                            || !entry.version.equals(identity(source)))
+                        throw new IOException("来源或目标文件已变化，已保留来源：" + source.name);
+                    removeSingleSource(source);
+                }
+                completed.add(source.key());
+            }
+        }
+    }
+    private void removeSingleSource(Node source) throws IOException {
+        Tasks.Progress.phase("删除来源");
+        checkRemoval(source);
+        Tasks.Progress.check();
+        if (source.root) RootMutations.removeEmpty(context, source);
+        else if (source.file != null) Files.delete(source.file.toPath());
+        else if (source.directory || document(source.uri).directory
+                || !DocumentsContract.deleteDocument(context.getContentResolver(), source.uri))
+            throw new IOException("未能安全移除来源：" + source.name);
+    }
     final class CopyLedger {
-        private final Map<Node, String> created = new LinkedHashMap<>();
+        private static final class Owned {
+            String identity;
+            MessageDigest written;
+            private String digest;
+            Owned(String identity, MessageDigest written) { this.identity = identity; this.written = written; }
+            String digest() {
+                if (digest == null) digest = hexDigest(written.digest());
+                return digest;
+            }
+        }
+        private final Map<Node, Owned> created = new LinkedHashMap<>();
         void record(Node node) throws IOException {
-            created.put(node, node.root && node.identity != null ? node.identity : identity(node));
+            // A document ID can name a replaced file. SAF ownership is recorded from the actual
+            // writable descriptor below, avoiding another provider open on the ordinary copy path.
+            String owned = node.uri != null ? null
+                    : node.root && node.identity != null ? node.identity : identity(node);
+            created.put(node, new Owned(owned, null));
         }
         private String identity(Node node) throws IOException {
-            if (node.file == null) return node.key();
+            if (node.uri != null) return storageObjectIdentity(node);
             if (node.root) return RootDirectoryReader.stat(node.path(), "%d:%i", false);
             try {
                 android.system.StructStat stat = android.system.Os.lstat(node.path());
@@ -1218,32 +1378,52 @@ final class FileStore {
         void rollback(Exception failure) {
             List<Node> nodes = new ArrayList<>(created.keySet());
             Collections.reverse(nodes);
-            for (Node node : nodes) try {
-                if (!created.get(node).equals(identity(node))) continue;
+            for (Node node : nodes) try { Tasks.Progress.cleanup(() -> {
+                // deleteDocument(directory) is recursive, including on a newly created directory.
+                // SAF has no atomic nonrecursive rmdir, so preserve every directory at every level.
+                if (node.uri != null && node.directory) return;
+                Owned owned = created.get(node);
+                if (owned.identity == null || !owned.identity.equals(identity(node))) return;
                 if (node.uri != null) {
-                    if (!node.directory || list(node).isEmpty()) {
-                        if (!DocumentsContract.deleteDocument(context.getContentResolver(), node.uri))
-                            throw new IOException("无法清理未完成的复制：" + node.name);
-                    }
+                    // Preserve a document replaced by a directory or edited by another writer.
+                    if (document(node.uri).directory || !contentSignature(node, new HashSet<>()).equals("file:" + owned.digest())
+                            || !owned.identity.equals(identity(node))) return;
+                    if (!DocumentsContract.deleteDocument(context.getContentResolver(), node.uri))
+                        throw new IOException("无法清理未完成的复制：" + node.name);
                 } else if (node.root) {
-                    Tasks.Progress.cleanup(() -> RootMutations.removeEmpty(context, node));
+                    RootMutations.removeEmpty(context, node);
                 } else Files.deleteIfExists(node.file.toPath());
+            });
             } catch (IOException | RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+        }
+        OutputStream recording(Node node, OutputStream output) {
+            Owned owned = created.get(node);
+            if (owned == null || node.uri == null || node.directory || !(output instanceof FileOutputStream file)) return output;
+            try {
+                android.system.StructStat stat = android.system.Os.fstat(file.getFD());
+                if (!android.system.OsConstants.S_ISREG(stat.st_mode)) return output;
+                owned.identity = fileIdentity(stat); owned.written = sha256Digest();
+                return new java.security.DigestOutputStream(output, owned.written);
+            } catch (IOException | android.system.ErrnoException unavailable) { return output; }
         }
     }
     private InputStream readCopy(Node source, MessageDigest digest) throws IOException {
         InputStream input = read(source);
         return digest == null ? input : new java.security.DigestInputStream(input, digest);
     }
-    private void copyContent(Node source, Node target, Set<String> seen, CopyLedger ledger, MessageDigest digest) throws IOException {
+    private void copyContent(Node source, Node target, Set<String> seen, CopyLedger ledger, MessageDigest digest, MoveMembers members) throws IOException {
+        Tasks.Progress.phase("复制文件");
+        if (members != null) members.record(source, target);
         Tasks.Progress.step(source.name);
         String key = source.file != null ? source.file.getCanonicalPath() : source.key();
         if (!seen.add(key)) throw new IOException("目录包含循环引用");
         if (source.directory) {
-            for (Node n : list(source)) {
+            List<Node> children = list(source);
+            Tasks.Progress.discovered(source, children);
+            for (Node n : children) {
                 Node made = createAbsent(target, n.name, n.directory);
                 ledger.record(made);
-                copyContent(n, made, seen, ledger, null);
+                copyContent(n, made, seen, ledger, null, members);
             }
         } else {
             // Targets are newly created; direct streaming needs no second complete cache copy.
@@ -1259,7 +1439,7 @@ final class FileStore {
                                 ? context.getContentResolver().openOutputStream(target.uri, "wt")
                                 : new BufferedOutputStream(new FileOutputStream(target.file))) {
                 if (out == null) throw new IOException("目标目录只读");
-                pump(in, out);
+                pump(in, ledger.recording(target, out));
             }
         }
         FileTimes.copied(context,source,target);
@@ -1315,6 +1495,7 @@ final class FileStore {
         return source.root ? Long.parseLong(RootDirectoryReader.stat(source.path(), "%s", true)) : source.file.length();
     }
     Node extract(List<Node> sources, Node parent, String folderName) throws IOException {
+        Tasks.Progress.budget("准备解压", -1);
         if (sources.isEmpty()) throw new IOException("请选择压缩包或包内条目");
         checkName(folderName);
         if (parent.container != null) throw new IOException("请选择压缩包以外的解压目录");
@@ -1330,24 +1511,29 @@ final class FileStore {
                     else {
                         staged = Files.createTempDirectory(context.getCacheDir().toPath(), "extract-").toFile();
                         ArchiveOps.extract(archive, "", staged);
-                        copyAll(list(local(staged)), output, false);
+                        List<Node> stagedChildren = list(local(staged));
+                        Tasks.Progress.replan(stagedChildren, "写入解压目录");
+                        copyAll(stagedChildren, output, false);
                     }
                 } finally { release(source, archive); }
             } else {
-                for (Node source : sources) {
-                    if (source.container == null) throw new IOException("请选择同一压缩包内的条目");
-                    // The archive index validates paths; selected entries use the same bounded extractor.
-                    File archive = archiveView(source.container);
-                    try {
+                try (ArchiveReads reads = new ArchiveReads()) {
+                    for (Node source : sources) {
+                        if (source.container == null) throw new IOException("请选择同一压缩包内的条目");
+                        // Reuse each private archive snapshot for the whole extraction.
+                        File archive = archiveView(source.container);
                         if (staged == null) staged = Files.createTempDirectory(context.getCacheDir().toPath(), "extract-").toFile();
                         ArchiveOps.extract(archive, source.entry, staged, true);
-                    } finally { release(source.container, archive); }
+                    }
                 }
-                copyAll(list(local(staged)), output, false);
+                List<Node> stagedChildren = list(local(staged));
+                Tasks.Progress.replan(stagedChildren, "写入解压目录");
+                copyAll(stagedChildren, output, false);
             }
             return output;
         } catch (IOException | RuntimeException error) {
-            try { Tasks.Progress.cleanup(() -> delete(output)); } catch (IOException cleanup) { error.addSuppressed(cleanup); }
+            // This directory is user-visible while extraction runs. A late arrival or edit
+            // must survive cancellation/failure; only the private staging area is disposable.
             throw error;
         } finally {
             if (staged != null) {
@@ -1375,7 +1561,8 @@ final class FileStore {
         n = RootAccess.automatic(n);
         if (n.file != null && !n.root) return n.file;
         File f = File.createTempFile("import-", "-" + n.name.replaceAll("[^a-zA-Z0-9.]", "_"), context.getCacheDir());
-        try (InputStream in = read(n); OutputStream out = new FileOutputStream(f)) { pump(in, out); }
+        try (Tasks.Progress.Phase stage = Tasks.Progress.stage("准备来源");
+             InputStream in = read(n); OutputStream out = new FileOutputStream(f)) { pump(in, out); }
         catch (IOException | RuntimeException e) { Files.deleteIfExists(f.toPath()); throw e; }
         if (n.file != null) ArchiveOps.copyPassword(n.file, f);
         return f;
@@ -1398,6 +1585,7 @@ final class FileStore {
     }
     private final Map<File,File> splitStaging=new java.util.concurrent.ConcurrentHashMap<>();
     private File uncachedArchiveView(Node container) throws IOException {
+        try (Tasks.Progress.Phase stage = Tasks.Progress.stage("准备归档")) {
         File snapshot = Boolean.TRUE.equals(freshArchiveReads.get()) ? null : archiveSnapshots.get(container.key());
         if (snapshot != null) return snapshot;
         Node node = RootAccess.automatic(container);
@@ -1418,6 +1606,7 @@ final class FileStore {
             }
             splitStaging.put(main,folder);return main;
         }catch(IOException|RuntimeException error){try(var paths=Files.walk(folder.toPath())){for(var path:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(path);}Files.deleteIfExists(staged.toPath());throw error;}
+        }
     }
     final class ArchiveReads implements AutoCloseable {
         private final boolean owner = copyingArchives.get() == null;
@@ -1473,6 +1662,7 @@ final class FileStore {
             this(source, expected, false);
         }
         ArchiveSnapshot(Node source, String expected, boolean allowDirectZip) throws IOException {
+            try (Tasks.Progress.Phase stage = Tasks.Progress.stage("准备归档")) {
             this.source = source;
             Node direct = RootAccess.automatic(source);
             directSplit = SplitZipEdits.canEdit(direct);
@@ -1523,6 +1713,7 @@ final class FileStore {
                 }
                 archiveSnapshots.put(source.key(), copy);
             } catch (IOException | RuntimeException e) { release(source, copy); throw e; }
+            }
         }
         void verify() throws IOException { checkRevision(source, revision); }
         private void verifyDirect() throws IOException {

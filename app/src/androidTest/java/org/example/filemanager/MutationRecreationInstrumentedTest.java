@@ -81,7 +81,7 @@ public class MutationRecreationInstrumentedTest {
         scenario.recreate();
         scenario.onActivity(activity -> assertTrue("New activity should reattach to the running mutation", bool(activity, "busy")));
         assertNotNull("Recreated operations keep their cancel control",
-                device.wait(Until.findObject(By.desc("操作进度")), 3000));
+                device.wait(Until.findObject(By.desc("文件操作进度")), 3000));
         release.countDown();
         long deadline = SystemClock.uptimeMillis() + 10000;
         while (!output.isFile() && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(40);
@@ -97,7 +97,7 @@ public class MutationRecreationInstrumentedTest {
             } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
         });
         UiObject2 row = device.wait(Until.findObject(By.text(output.getName())), 5000); assertNotNull(row);
-        assertFalse(device.hasObject(By.desc("操作进度")));
+        assertFalse(device.hasObject(By.desc("文件操作进度")));
     }
 
     @Test public void partialTransferAfterRecreationKeepsRetryAndOriginalDestination() throws Exception {

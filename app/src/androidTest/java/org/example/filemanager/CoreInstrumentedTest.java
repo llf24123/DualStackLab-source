@@ -97,7 +97,8 @@ public class CoreInstrumentedTest {
             assertEquals("org.example.installfixture", context.getPackageManager().getPackageArchiveInfo(staged.getAbsolutePath(), 0).packageName);
             assertEquals(ApkTools.sha256(apk), ApkTools.sha256(staged));
             assertTrue(ApkDialog.inspect(staged, 26)[0].contains("V2"));
-            assertTrue(ApkInstall.silentCommand(staged).contains("-S " + staged.length() + " < "));
+            assertEquals("/system/bin/pm install -r --user 10 -S " + staged.length(),
+                    ApkInstall.silentCommand(staged.length(), 10));
             File payload = new File(work, "extra.txt"); text(payload, "changed APK");
             ArchiveOps.rewrite(apk, null, null, Map.of("extra.txt", payload));
             assertEquals("changed APK", new String(ArchiveOps.bytes(apk, "extra.txt", 100), StandardCharsets.UTF_8));
@@ -643,9 +644,15 @@ public class CoreInstrumentedTest {
         FileStore.shell("chmod 640 " + FileStore.quote(target.getAbsolutePath()), false);
         String before = FileStore.shell("stat -c '%a:%u:%g' " + FileStore.quote(target.getAbsolutePath()), false);
         Process process = new ProcessBuilder("sh", "-c", FileStore.rootWriteCommand(
-                context.getApplicationInfo().sourceDir, target.getAbsolutePath(), temporary.getAbsolutePath(), -1, null)).start();
-        try (OutputStream output = process.getOutputStream()) { output.write("after".getBytes(StandardCharsets.UTF_8)); }
-        assertTrue(process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)); assertEquals(0, process.exitValue());
+                context.getApplicationInfo().sourceDir, target.getAbsolutePath(), temporary.getAbsolutePath(), -1, null))
+                .redirectErrorStream(true).start();
+        try {
+            try (OutputStream output = process.getOutputStream()) { output.write("after".getBytes(StandardCharsets.UTF_8)); }
+            assertTrue("app_process did not finish writing", process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(new String(FileStore.readBytes(process.getInputStream(), 4096), StandardCharsets.UTF_8), 0, process.exitValue());
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
+        }
         assertEquals("after", new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8));
         assertEquals(before, FileStore.shell("stat -c '%a:%u:%g' " + FileStore.quote(target.getAbsolutePath()), false));
         assertFalse(temporary.exists());

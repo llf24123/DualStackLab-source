@@ -145,7 +145,8 @@ public class AppDirectoryIconsInstrumentedTest {
                         assertEquals(badge.getWidth(), visible.width());
                         assertEquals(badge.getHeight(), visible.height());
                         assertNotNull(badge.getDrawable());
-                        assertEquals(Ui.dp(activity, comfortable ? 52 : 41), row.getHeight());
+                        float fontScale = Math.max(1f, activity.getResources().getConfiguration().fontScale);
+                        assertEquals(Math.round(Ui.dp(activity, comfortable ? 52 : 48) * fontScale), row.getHeight());
                         checked = true;
                     }
                     assertTrue(side, checked);

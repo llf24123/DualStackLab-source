@@ -107,6 +107,33 @@ public class CancellationBoundaryInstrumentedTest {
         assertEquals("one", localText(one)); assertEquals("two", localText(two)); assertEquals("neighbour", localText(sentinel));
     }
 
+    @Test public void batchMoveCancelledWhileSnapshottingChangesNeitherSide() throws Exception {
+        assertSnapshotCancellation(false);
+    }
+
+    @Test public void rootBatchMoveCancelledWhileSnapshottingChangesNeitherSide() throws Exception {
+        Assume.assumeTrue("Requires granted su, not a particular helper verdict", RootAccess.available());
+        assertSnapshotCancellation(true);
+    }
+
+    private void assertSnapshotCancellation(boolean root) throws Exception {
+        File source = directory(work, "source"), destination = directory(work, "destination");
+        File one = file(source, "one.txt", "one"), two = file(source, "two.txt", "two"), three = file(source, "three.txt", "three");
+        File keep = file(destination, "keep.txt", "neighbour");
+        String oneIdentity = identity(one), twoIdentity = identity(two), threeIdentity = identity(three), keepIdentity = identity(keep);
+        Tasks.Progress progress = new Tasks.Progress();
+        CancelDuringSnapshot inputs = new CancelDuringSnapshot(List.of(FileStore.local(one, root),
+                FileStore.local(two, root), FileStore.local(three, root)), progress);
+        expectCancelled(() -> progress.run(() -> store.copyAll(inputs, FileStore.local(destination, root), true)));
+        assertTrue("Cancellation must be injected while snapshotting the inputs", inputs.triggered);
+        assertEquals("Snapshot cancellation must precede every move", 0, progress.done.get());
+        assertEquals(oneIdentity, identity(one)); assertEquals(twoIdentity, identity(two));
+        assertEquals(threeIdentity, identity(three)); assertEquals(keepIdentity, identity(keep));
+        assertEquals("one", localText(one)); assertEquals("two", localText(two));
+        assertEquals("three", localText(three)); assertEquals("neighbour", localText(keep));
+        assertNames(source, "one.txt", "two.txt", "three.txt"); assertNames(destination, "keep.txt");
+    }
+
     @Test public void fastBatchMoveKeepsFirstItemWhenCancelledBeforeSecond() throws Exception {
         // Runs on both device classes: ordinary local fast path without su, automatic ROOT with su.
         assertMoveBoundary(false);
@@ -124,11 +151,10 @@ public class CancellationBoundaryInstrumentedTest {
         String oneIdentity = identity(one), twoIdentity = identity(two), threeIdentity = identity(three);
         assertEquals(Os.stat(source.getPath()).st_dev, Os.stat(destination.getPath()).st_dev);
         Tasks.Progress progress = new Tasks.Progress();
-        CancelOnSecondPass inputs = new CancelOnSecondPass(List.of(FileStore.local(one, root),
-                FileStore.local(two, root), FileStore.local(three, root)), progress);
-        expectCancelled(() -> progress.run(() -> store.copyAll(inputs, FileStore.local(destination, root), true)));
-        assertTrue("Cancellation must occur in the actual move pass", inputs.triggered);
-        assertEquals("One preflight and one execution iterator", 2, inputs.passes);
+        CancelAfterFirstMove boundary = new CancelAfterFirstMove(destination, one, progress);
+        List<FileStore.Node> inputs = List.of(FileStore.local(one, root), FileStore.local(two, root), FileStore.local(three, root));
+        expectCancelled(() -> progress.run(() -> store.copyAll(inputs, FileStore.local(boundary, root), true)));
+        assertTrue("Cancellation must occur after the first move is physically published", boundary.triggered);
         assertTrue("The completed first move must be counted", progress.done.get() > 0);
         assertFalse("Completed move was falsely rolled back", one.exists());
         assertEquals(oneIdentity, identity(new File(destination, "one.txt")));
@@ -289,11 +315,11 @@ public class CancellationBoundaryInstrumentedTest {
         }
     }
 
-    /** copyAll(move) validates one complete pass, then executes a fresh pass. Never cancel in preflight. */
+    /** deleteAll validates its first pass and groups the second pass before rewriting any archive. */
     private static final class CancelOnSecondPass extends AbstractCollection<FileStore.Node> {
         private final List<FileStore.Node> nodes;
         private final Tasks.Progress progress;
-        int passes;
+        private int passes;
         boolean triggered;
         CancelOnSecondPass(List<FileStore.Node> nodes, Tasks.Progress progress) { this.nodes = nodes; this.progress = progress; }
         @Override public int size() { return nodes.size(); }
@@ -308,6 +334,43 @@ public class CancellationBoundaryInstrumentedTest {
                     return nodes.get(next++);
                 }
             };
+        }
+    }
+
+    /** Cancel when the transfer copies the collection into its execution snapshot, after metadata planning. */
+    private static final class CancelDuringSnapshot extends AbstractCollection<FileStore.Node> {
+        private final List<FileStore.Node> nodes;
+        private final Tasks.Progress progress;
+        boolean triggered;
+        CancelDuringSnapshot(List<FileStore.Node> nodes, Tasks.Progress progress) { this.nodes = nodes; this.progress = progress; }
+        @Override public int size() { return nodes.size(); }
+        @Override public Iterator<FileStore.Node> iterator() { return nodes.iterator(); }
+        @Override public Object[] toArray() {
+            Object[] snapshot = nodes.toArray();
+            triggered = true; progress.cancelled.set(true);
+            return snapshot;
+        }
+    }
+
+    /**
+     * The same-directory guard resolves the destination before admitting each move. Trigger on
+     * that synchronous boundary only after the first rename has removed its source and published
+     * its target. No polling thread or timing window can race the second move's cancellation check.
+     */
+    private static final class CancelAfterFirstMove extends File {
+        private final File firstSource, firstTarget;
+        private final Tasks.Progress progress;
+        boolean triggered;
+        CancelAfterFirstMove(File destination, File firstSource, Tasks.Progress progress) {
+            super(destination.getPath());
+            this.firstSource = firstSource; this.firstTarget = new File(destination, firstSource.getName());
+            this.progress = progress;
+        }
+        @Override public File getCanonicalFile() throws IOException {
+            if (!triggered && !firstSource.exists() && firstTarget.isFile()) {
+                triggered = true; progress.cancelled.set(true);
+            }
+            return super.getCanonicalFile();
         }
     }
 

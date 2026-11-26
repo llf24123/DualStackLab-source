@@ -20,7 +20,8 @@ final class TransferPlan {
     final Set<String> removedArchives = new HashSet<>();
     final Set<String> removedSources = new HashSet<>();
     final Set<String> settled = new HashSet<>();
-    int retainedEmptyDirectories;
+    final Map<String, FileStore.MoveMembers> moveMembers = new HashMap<>();
+    int retainedSourceDirectories, retainedEmptyDirectories;
     static final class Incomplete extends IOException {
         final TransferPlan plan;
         Incomplete(TransferPlan plan, Exception cause) {

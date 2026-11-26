@@ -1,8 +1,8 @@
-# DualStackLab 0.6.56 · 源码版
+# DualStackLab 0.6.64 · 源码版
 
 DualStackLab 是 Android 双窗口文件管理器，支持本地与归档文件操作、书签、媒体预览、文本与十六进制编辑、终端，以及用户配置的远程存储。最低支持 Android 8.0（API 26），目标 API 36。
 
-[本版改动](docs/releases/0.6.56.md) · [本地签名说明](docs/SIGNING.md)
+[版本记录](docs/releases) · [本地签名说明](docs/SIGNING.md)
 
 ## 从源码构建
 
@@ -26,7 +26,7 @@ DualStackLab 是 Android 双窗口文件管理器，支持本地与归档文件�
 
 - 在双窗中浏览目录，长按文件可复制、移动或查看属性；长按同步按钮可按关键字过滤当前列表。
 - 直接浏览归档或预览本地图片、音频和视频；APK 与分包安装均保留系统确认入口。
-- 需要远程文件时，可自行添加 WebDAV、SMB 或 SFTP 服务器。本地浏览不需要远程账户。
+- 需要远程文件时，可自行添加 FTP、SSH（SFTP）、HTTPS WebDAV 或 SMB 服务器。SSH（SFTP）支持密码和私钥登录。本地浏览不需要远程账户。
 
 ## 许可证
 

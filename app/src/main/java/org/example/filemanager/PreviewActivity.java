@@ -158,8 +158,10 @@ public class PreviewActivity extends LabActivity {
             try {
                 String parentKey = getIntent().getStringExtra("imageParentKey");
                 FileStore.Node parent = parentKey == null ? store.parent(selected) : store.fromKey(parentKey);
+                String filter = getIntent().getStringExtra("imageFilter");
+                FileNameFilter match = FileNameFilter.compile(filter == null ? "" : filter, getIntent().getBooleanExtra("imageRegex", false));
                 if (parent != null) for (FileStore.Node child : store.list(parent)) {
-                    if (!child.directory && isImageName(child.name)
+                    if (!child.directory && isImageName(child.name) && match.matches(child.name)
                             && (getIntent().getBooleanExtra("imageShowHidden", true) || !child.name.startsWith(".") || child.key().equals(selected.key())))
                         siblings.add(child);
                 }

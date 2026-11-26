@@ -24,6 +24,7 @@ public class MainActivity extends LabActivity {
     private static final int TREE = 100, ARTIFACT = 200, INSTALLED = 400, BACKUP = 401, SETTINGS = 402, SHIZUKU = 808;
     private FileStore store;
     private AppIcons appIcons;
+    private String selectionSession;
     private DirectoryPlaces directoryPlaces;
     private Pane left, right, active;
     private TextView title, subtitle, status;
@@ -47,6 +48,7 @@ public class MainActivity extends LabActivity {
     private boolean busy, resumed;
     private static final java.util.concurrent.atomic.AtomicBoolean MUTATING = new java.util.concurrent.atomic.AtomicBoolean();
     private Runnable closeMutation;
+    private OperationProgressView operationProgress;
     private Boolean selectionActions;
     private final Map<String, DirectorySnapshot> directorySnapshots = new LinkedHashMap<>(24, .75f, true);
     private final Map<String, String> archiveParents = new LinkedHashMap<>();
@@ -124,11 +126,14 @@ public class MainActivity extends LabActivity {
                     left.chromeInsets(topInset,bottomInset);right.chromeInsets(topInset,bottomInset);
                 });
         root.addView(chrome,new LinearLayout.LayoutParams(-1,0,1));
+        operationProgress = new OperationProgressView(this); chrome.progress(operationProgress);
         Ui.install(this, root);
         chrome.apply(root.getChildAt(0));
         int indicatorVisibility=Ui.material==ThemeMaterial.FROST?View.INVISIBLE:View.VISIBLE;
         left.indicator.setVisibility(indicatorVisibility);right.indicator.setVisibility(indicatorVisibility);
         activate(left);
+        selectionSession = saved == null ? null : saved.getString("selectionSession");
+        if (selectionSession == null) selectionSession = UUID.randomUUID().toString();
         if (saved == null) { restoreFilter(left); restoreFilter(right); }
         restore(left, saved); restore(right, saved);
         if (saved != null) {
@@ -141,6 +146,7 @@ public class MainActivity extends LabActivity {
         if (saved == null || ExternalFiles.uri(getIntent()) != null) navigateIntent(getIntent());
         if (saved == null) {
             EditorDrafts.WORKER.execute(() -> EditorDrafts.prune(getApplicationContext(), 14L * 24 * 60 * 60 * 1000));
+            Tasks.IO.execute(() -> SplitApks.cleanAbandonedWorkspaces(getCacheDir()));
             SafRecovery.offerPending(this);
             RenameJournal.offerPending(this);
         }
@@ -186,7 +192,7 @@ public class MainActivity extends LabActivity {
                         } else {
                             status.setVisibility(View.GONE);
                             Tasks.toast(this, "来源未提供可访问的实际目录，直接打开原文件");
-                            open(received.node());
+                            open(received.node(), true);
                         }
                     });
                 } catch (Exception error) {
@@ -227,6 +233,7 @@ public class MainActivity extends LabActivity {
     @Override protected void onSaveInstanceState(Bundle out) {
         if (inlineFilter != null) inlineFilter.finishLastValid();
         super.onSaveInstanceState(out);
+        out.putString("selectionSession", selectionSession);
         out.putString("left", locationKey(left.location)); out.putString("right", locationKey(right.location));
         out.putBoolean("activeRight", active == right);
         Bundle parents = new Bundle();
@@ -236,7 +243,7 @@ public class MainActivity extends LabActivity {
     }
     private void savePaneState(Bundle out, String key, Pane pane) {
         out.putString(key + ".filter", pane.filter); out.putBoolean(key + ".regex", pane.regex); out.putInt(key + ".sort", pane.sort);
-        out.putStringArrayList(key + ".selected", new ArrayList<>(pane.selected));
+        PaneSelections.save(this, out, key + ".selected", pane.selected, selectionSession);
         int[] pending = pane.location != null && (pane.pendingRestoreKey != null || pane.loading != null)
                 ? pane.positions.get(pane.location.key()) : null;
         out.putInt(key + ".position", pending == null ? pane.list.getFirstVisiblePosition() : pending[0]);
@@ -249,8 +256,7 @@ public class MainActivity extends LabActivity {
     }
     private void restorePaneState(Bundle saved, String key, Pane pane) {
         pane.filter = saved.getString(key + ".filter", ""); pane.regex = saved.getBoolean(key + ".regex", false); pane.sort = saved.getInt(key + ".sort");
-        ArrayList<String> selection = saved.getStringArrayList(key + ".selected");
-        if (selection != null) pane.selected.addAll(selection);
+        PaneSelections.restore(this, saved, key + ".selected", pane.selected);
         String restoredKey = saved.getString(pane.isLeft ? "left" : "right");
         if (restoredKey != null) pane.positions.put(restoredKey, new int[]{saved.getInt(key + ".position"), saved.getInt(key + ".top")});
         pane.restoreHistory(saved.getStringArrayList(key + ".back"), saved.getStringArrayList(key + ".forward"));
@@ -322,7 +328,7 @@ public class MainActivity extends LabActivity {
     private int scaled(int n) {
         return Math.round(dp(n) * Math.max(1f, getResources().getConfiguration().fontScale));
     }
-    private int rowHeight() { return Math.max(dp(comfortable ? 52 : 41), scaled(comfortable ? 52 : 41)); }
+    private int rowHeight() { return scaled(comfortable ? 52 : 48); }
     private LinearLayout.LayoutParams lp(int w, int h) {
         return new LinearLayout.LayoutParams(w < 0 ? w : dp(w), h < 0 ? h : dp(h));
     }
@@ -1089,8 +1095,8 @@ public class MainActivity extends LabActivity {
             for (FileStore.Node output : outputs) addResultHighlight(output);
             source.reload(); target.reload(); actionBar();
             Tasks.toast(this, (move ? "移动" : "复制") + "完成 · " + outputs.size() + " 项" + (plan.skipped.isEmpty() ? "" : " · 跳过 " + plan.skipped.size() + " 项")
-                    + (plan.retainedEmptyDirectories == 0 ? "" : " · 来源保留 " + plan.retainedEmptyDirectories + " 个空目录"));
-        }, move, error -> transferFailure(error, nodes, source, target, destination, move),
+                    + retainedDirectoriesMessage(plan.retainedEmptyDirectories + plan.retainedSourceDirectories));
+        }, true, error -> transferFailure(error, nodes, source, target, destination, move),
                 new Tasks.Transfer(nodes, destination, source.isLeft, target.isLeft, move));
     }
     private void executeTransfer(List<FileStore.Node> nodes, Pane source, Pane target, FileStore.Node destination,
@@ -1100,7 +1106,8 @@ public class MainActivity extends LabActivity {
     private void executeTransfer(List<FileStore.Node> nodes, Pane source, Pane target, FileStore.Node destination,
                                  boolean move, Set<String> existing, FileStore.ConflictPolicy conflicts,
                                  FileStore.ArchiveMoveRecovery recovery) {
-        mutate(() -> recovery == null ? store.copyAll(nodes, destination, move, conflicts, new HashSet<>(existing))
+        int[] retained = {0};
+        mutate(() -> recovery == null ? store.copyAll(nodes, destination, move, conflicts, new HashSet<>(existing), node -> retained[0]++)
                         : store.resumeArchiveMove(recovery),
                 outputs -> {
                     source.selected.clear();
@@ -1110,9 +1117,12 @@ public class MainActivity extends LabActivity {
                     target.reload(); actionBar();
                     int skipped = nodes.size() - outputs.size();
                     Tasks.toast(this, (move ? "移动" : "复制") + "完成 · " + outputs.size() + " 项"
-                            + (skipped == 0 ? "" : " · 跳过 " + skipped + " 项"));
-                }, move, error -> transferFailure(error, nodes, source, target, destination, move),
+                            + (skipped == 0 ? "" : " · 跳过 " + skipped + " 项") + retainedDirectoriesMessage(retained[0]));
+                }, true, error -> transferFailure(error, nodes, source, target, destination, move),
                 new Tasks.Transfer(nodes, destination, source.isLeft, target.isLeft, move));
+    }
+    private static String retainedDirectoriesMessage(int count) {
+        return count == 0 ? "" : " · 已保留 " + count + " 个来源目录";
     }
     private void transferFailure(Exception error, List<FileStore.Node> nodes, Pane source, Pane target,
                                  FileStore.Node destination, boolean move) {
@@ -1165,7 +1175,10 @@ public class MainActivity extends LabActivity {
         Runnable close = showProgress ? showMutationProgress(progress) : () -> closeMutation = null;
         closeMutation = close;
         Tasks.run(this, Tasks.FILES, () -> {
-            try { T result = progress.run(job); Tasks.finishMutation(mutation, result, null); return result; }
+            try { T result = progress.run(() -> {
+                if (transfer != null) Tasks.Progress.plan(transfer.sources(), transfer.move() ? "移动文件" : "复制文件");
+                return job.run();
+            }); Tasks.finishMutation(mutation, result, null); return result; }
             catch (Exception error) { Tasks.finishMutation(mutation, null, error); throw error; }
             finally {
                 MUTATING.set(false);
@@ -1189,33 +1202,9 @@ public class MainActivity extends LabActivity {
         });
     }
     private Runnable showMutationProgress(Tasks.Progress progress) {
-        TextView detail = Ui.text(this, "准备中…", 13, Ui.TEXT);
-        detail.setPadding(dp(20), dp(8), dp(20), dp(4));
-        detail.setMaxLines(3); detail.setContentDescription("操作进度");
-        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setIndeterminate(true);
-        LinearLayout body = Ui.column(this); body.addView(detail);
-        LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(-1, -2);
-        barParams.setMargins(dp(20), dp(4), dp(20), dp(8)); body.addView(bar, barParams);
-        AlertDialog dialog = MaterialDialogs.builder(this).setTitle("正在处理").setView(body).setCancelable(false)
-                .setNegativeButton("取消", null).create();
-        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
-            progress.cancelled.set(true); detail.setText("正在停止，当前项目完成后结束…");
-            v.setEnabled(false);
-        }));
-        boolean[] finished = {false};
-        Handler progressHandler = new Handler(Looper.getMainLooper());
-        Runnable[] tick = new Runnable[1];
-        tick[0] = () -> {
-            if (finished[0] || isDestroyed() || isFinishing()) return;
-            if (!dialog.isShowing()) dialog.show();
-            if (!progress.cancelled.get()) detail.setText("已处理 " + progress.done.get() + " 项\n" + progress.current);
-            progressHandler.postDelayed(tick[0], 250);
-        };
-        progressHandler.postDelayed(tick[0], 400);
+        operationProgress.bind(progress);
         return () -> {
-            finished[0] = true; progressHandler.removeCallbacks(tick[0]);
-            if (dialog.isShowing()) dialog.dismiss();
+            operationProgress.clear();
             closeMutation = null;
         };
     }
@@ -1301,14 +1290,18 @@ public class MainActivity extends LabActivity {
                 destination = FileStore.directory(value, initial.root && initial.file.equals(value));
             }
             FileStore.Node outputParent = destination;
+            dialog.dismiss();
             mutate(() -> store.extract(nodes, outputParent, folder), output -> {
-                dialog.dismiss(); source.selected.clear(); source.reload();
+                source.selected.clear(); source.reload();
                 target.reveal = output.name; target.navigate(outputParent);
                 Tasks.toast(this, "解压完成 · " + output.path()); actionBar();
             });
         })); dialog.show();
     }
     private void open(FileStore.Node node) {
+        open(node, false);
+    }
+    private void open(FileStore.Node node, boolean external) {
         OpenMethods.Choice preferred = OpenMethods.find(this, node.name);
         if (preferred != null) {
             if (preferred.external()) OpenMethods.launch(this, node, preferred, () -> openWith(node));
@@ -1352,7 +1345,15 @@ public class MainActivity extends LabActivity {
             else structuredArchive(node, "arsc");
             return;
         }
-        if (name.endsWith(".elf")) { executeFile(node); return; }
+        if (name.endsWith(".elf")) {
+            if (external) {
+                MaterialDialogs.builder(this).setTitle("运行外部文件？")
+                        .setMessage(node.name + "\n\n此文件由其他应用提供，将使用本应用的普通权限运行。")
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton("运行", (dialog, which) -> launchExecutable(node, false, false, true)).show();
+            } else executeFile(node);
+            return;
+        }
         if (name.endsWith(".sh")) {
             scriptDialog(node);
             return;
@@ -1385,16 +1386,10 @@ public class MainActivity extends LabActivity {
         Intent intent = new Intent(this, ArchiveActivity.class); node.put(intent); startActivity(intent);
     }
     private void structuredArchive(FileStore.Node node, String mode) {
-        Tasks.run(this, () -> {
-            File folder = java.nio.file.Files.createTempDirectory(getCacheDir().toPath(), "resource-edit-").toFile();
-            File work = new File(folder, node.container.name);
-            try (InputStream in = store.read(node.container); OutputStream out = new FileOutputStream(work)) { FileStore.pump(in, out); }
-            return work;
-        }, file -> {
-            Intent intent = new Intent(this, EditorActivity.class); node.container.put(intent);
-            intent.putExtra("archivePath", file.getAbsolutePath()).putExtra("archiveEntry", node.entry)
-                    .putExtra("displayName", node.name).putExtra("mode", mode).putExtra("ownedArchive", true); startActivity(intent);
-        });
+        Intent intent = new Intent(this, EditorActivity.class);
+        node.container.put(intent);
+        intent.putExtra("archiveEntry", node.entry).putExtra("displayName", node.name).putExtra("mode", mode);
+        startActivity(intent);
     }
     private void promptPassword(File file, Runnable after) {
         EditText input = Ui.input(this, "归档密码");
@@ -1421,8 +1416,10 @@ public class MainActivity extends LabActivity {
         Intent intent = new Intent(this, PreviewActivity.class); node.put(intent); intent.putExtra("kind", kind);
         if ("image".equals(kind)) {
             intent.putExtra("imageSort", active.sort).putExtra("imageShowHidden", showHidden);
-            if (active.entries.stream().anyMatch(entry -> entry.key().equals(node.key())))
+            if (active.entries.stream().anyMatch(entry -> entry.key().equals(node.key()))) {
                 intent.putExtra("imageParentKey", active.location.key());
+                intent.putExtra("imageFilter", active.filter).putExtra("imageRegex", active.regex);
+            }
         }
         startActivity(intent);
     }
@@ -1431,7 +1428,6 @@ public class MainActivity extends LabActivity {
                 this::startNormalInstall, this::installPrivileged, path -> navigateDirectory(path, false));
     }
     private void installPrivileged(File file) {
-        if(!RootAccess.known()){startNormalInstall(file);return;}
         AlertDialog progress = MaterialDialogs.builder(this).setTitle("准备安装")
                 .setMessage("正在处理 " + file.getName()).setCancelable(false).create(); progress.show();
         Tasks.run(this, Tasks.SHELL, () -> {

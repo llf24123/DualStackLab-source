@@ -48,10 +48,11 @@ public class DirectFlowInstrumentedTest {
     @Test public void copyAndMoveExecuteFromTheSelectionMenu() throws Exception {
         screen = ActivityScenario.launch(MainActivity.class);
         transfer("复制");
-        await(() -> new File(destination, "item.txt").exists());
+        File copied = new File(destination, "item.txt");
+        await(() -> copied.length() == new File(source, "item.txt").length());
         assertTrue(new File(source, "item.txt").exists());
-        assertEquals("payload", new String(Files.readAllBytes(new File(destination, "item.txt").toPath()), StandardCharsets.UTF_8));
-        Files.delete(new File(destination, "item.txt").toPath());
+        assertEquals("payload", new String(Files.readAllBytes(copied.toPath()), StandardCharsets.UTF_8));
+        Files.delete(copied.toPath());
         transfer("移动");
         await(() -> new File(destination, "item.txt").exists() && !new File(source, "item.txt").exists());
         assertFalse(device.hasObject(By.text("已加入任务中心，可继续浏览")));
@@ -71,6 +72,9 @@ public class DirectFlowInstrumentedTest {
     @Test public void drawerAndManifestHaveNoTaskCenterOrRecycleBin() throws Exception {
         screen = ActivityScenario.launch(MainActivity.class);
         find(By.desc("位置与工具")).click();
+        find(By.desc("位置与工具列表"));
+        assertTrue(new UiScrollable(new UiSelector().description("位置与工具列表"))
+                .scrollIntoView(new UiSelector().text("设备信息")));
         find(By.text("设备信息"));
         assertFalse(device.hasObject(By.text("任务中心")));
         assertFalse(device.hasObject(By.text("回收站")));
@@ -80,7 +84,7 @@ public class DirectFlowInstrumentedTest {
         assertTrue(info.services == null || info.services.length == 0);
     }
 
-    @Test public void workerStartsBeforeProgressAndRecreationClosesItsOldWindow() throws Exception {
+    @Test public void workerStartsBeforeProgressAndRecreationReattachesTheInlineStrip() throws Exception {
         CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1), ended = new CountDownLatch(1);
         AtomicBoolean secondJobRan = new AtomicBoolean();
         MainActivity[] previous = {null};
@@ -92,11 +96,12 @@ public class DirectFlowInstrumentedTest {
                 finally { ended.countDown(); }
             }); });
             assertTrue("The file job must begin immediately", started.await(2, TimeUnit.SECONDS));
-            find(By.text("正在处理"));
+            find(By.desc("停止文件操作"));
+            assertFalse(device.hasObject(By.text("正在处理")));
             screen.recreate();
-            // A running operation now reattaches its progress to the recreated page.
-            // The destroyed page must release its own window without releasing the writer lock.
-            find(By.text("正在处理"));
+            // The recreated page reattaches the same running operation without releasing the writer lock.
+            find(By.desc("停止文件操作"));
+            assertFalse(device.hasObject(By.text("正在处理")));
             assertTrue(previous[0].isDestroyed());
             assertNull(Iteration38InstrumentedTest.field(previous[0], "closeMutation"));
             screen.onActivity(activity -> assertNotNull(Iteration38InstrumentedTest.field(activity, "closeMutation")));

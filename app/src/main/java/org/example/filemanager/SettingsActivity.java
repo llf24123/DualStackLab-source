@@ -142,7 +142,11 @@ public class SettingsActivity extends LabActivity {
                 () -> choice("启动路径",new String[]{"首页","上次路径"},prefs().getString("startup-"+side,"home").equals("last")?1:0,
                         n -> prefs().edit().putString("startup-"+side,n==0?"home":"last").apply()));
         add("启动","恢复默认首页",()->"左右窗口回到内部存储",()->MaterialDialogs.builder(this).setTitle("恢复默认首页？")
-                .setNegativeButton("取消",null).setPositiveButton("恢复",(d,n)->{main().edit().remove("home-left").remove("home-right").apply();render();}).show());
+                .setNegativeButton("取消",null).setPositiveButton("恢复",(d,n)->{
+                    String home = android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
+                    main().edit().putString("home-left",home).putString("home-right",home).apply();
+                    render();
+                }).show());
         add("外观","主题材质",()->ThemeMaterial.current(this).title+" · "+ThemePicker.modeLabel(Ui.themeMode(this)),()->Ui.chooseTheme(this));
         add("外观","文件图标样式",()->{
             ThemeMaterial m=ThemeMaterial.current(this);

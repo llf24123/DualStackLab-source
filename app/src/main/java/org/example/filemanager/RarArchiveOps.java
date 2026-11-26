@@ -111,6 +111,12 @@ final class RarArchiveOps {
         selectedName = selectedName.substring(selectedName.lastIndexOf('/') + 1);
         long total = 0;
         try (Archive archive = open(file)) {
+            long expected = 0;
+            for (FileHeader header : archive.getFileHeaders()) {
+                Tasks.Progress.check();
+                if (!header.isDirectory() && ArchiveOps.matchesSelection(normalize(header.getFileName()), prefix)) expected = ArchiveOps.addSize(expected, header.getFullUnpackSize());
+            }
+            Tasks.Progress.budget("解压文件", expected);
             for (FileHeader header : archive.getFileHeaders()) {
                 String path = normalize(header.getFileName());
                 Tasks.Progress.step(path);

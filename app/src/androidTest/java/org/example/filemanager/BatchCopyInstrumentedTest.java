@@ -210,7 +210,9 @@ public class BatchCopyInstrumentedTest {
             fail("Injected create failure was ignored");
         } catch (IOException expected) { }
         assertEquals("first", localText(first)); assertEquals("second", localText(broken));
-        assertEquals(List.of("keep.txt"), call("stats", null).getStringArrayList("paths"));
+        // SAF directory deletion is recursive; rollback keeps its empty directory after
+        // removing only the files whose writable descriptors belong to this operation.
+        assertEquals(List.of("keep.txt", "source/"), call("stats", null).getStringArrayList("paths"));
         assertEquals("existing-neighbour", documentText("root/keep.txt"));
     }
     @Test public void failedSafReadRemovesOnlyNewLocalOutputAndKeepsMoveSource() throws Exception {

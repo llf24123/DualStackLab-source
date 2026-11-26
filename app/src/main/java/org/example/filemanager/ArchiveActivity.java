@@ -3,6 +3,7 @@ package org.example.filemanager;
 import android.app.*;
 import android.content.*;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.*;
 import android.widget.*;
 import android.view.*;
@@ -20,12 +21,17 @@ public class ArchiveActivity extends LabActivity {
     private static final int IMPORT = 301, OUTPUT = 302, EDIT = 303;
     private FileStore store;
     private FileStore.Node source;
-    private File archive, pendingOutput;
+    private File archive;
+    private final ArchiveWorkspace workspace = new ArchiveWorkspace();
+    private boolean archiveReady;
+    private int pickerRequest;
+    private String pickerPrefix, pickerEntry, pickerRevision;
+    private Uri pickerResult;
     // A revision belongs to the bytes in archive, never to a later observation of source.
     private final Object workspaceLock = new Object();
-    private String sourceRevision;
+    private volatile String sourceRevision;
     private record ClassPreview(File file, String revision, String archivePath) {}
-    private String prefix = "", replacement, dexEntry;
+    private String prefix = "", dexEntry;
     private TextView path, summary;
     private ListView list;
     private SwipeRefreshLayout refresh;
@@ -35,8 +41,29 @@ public class ArchiveActivity extends LabActivity {
     private boolean busy, rawDex, rar, splitZip;
     private final Map<String, File> projects = new HashMap<>();
     private LinearLayout tools, browser;
+    private OperationProgressView operationProgress;
+    private boolean operationResumed;
+    private final Handler operationHandler = new Handler(Looper.getMainLooper());
+    private final Runnable extractionTick = this::observeExtraction;
+    private static volatile Extraction activeExtraction;
+    private static final class Extraction {
+        final String sourceKey;
+        final Tasks.Progress progress = new Tasks.Progress();
+        volatile File result;
+        volatile Exception error;
+        volatile boolean finished;
+        Extraction(String sourceKey) { this.sourceKey = sourceKey; }
+    }
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        if (saved != null) {
+            prefix = saved.getString("archivePrefix", "");
+            pickerRequest = saved.getInt("archivePicker");
+            pickerPrefix = saved.getString("pickerPrefix");
+            pickerEntry = saved.getString("pickerEntry");
+            pickerRevision = saved.getString("pickerRevision");
+            pickerResult = saved.getParcelable("pickerResult");
+        }
         store = new FileStore(this); LinearLayout root = Ui.column(this);
         LinearLayout top = Ui.toolbar(this, getIntent().getStringExtra("name"), this::finish);
         View toolButton = Ui.icon(this, R.drawable.ic_more, "APK 工具", Color.WHITE, this::toolMenu);
@@ -101,6 +128,7 @@ public class ArchiveActivity extends LabActivity {
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(tools);
         tools.setVisibility(View.GONE);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        operationProgress = new OperationProgressView(this); root.addView(operationProgress);
         scroll.setVisibility(View.GONE);
         apk.setOnClickListener(v -> { browser.setVisibility(View.GONE); scroll.setVisibility(View.VISIBLE); tools.setVisibility(View.VISIBLE); });
         files.setOnClickListener(v -> { if (!rawDex) { browser.setVisibility(View.VISIBLE); scroll.setVisibility(View.GONE); } });
@@ -110,22 +138,17 @@ public class ArchiveActivity extends LabActivity {
         });
         list.setOnItemLongClickListener((p, v, pos, id) -> { itemMenu(items.get(pos)); return true; });
         Ui.install(this, root);
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             source = store.fromIntent(getIntent()); rawDex = source.name.toLowerCase(Locale.ROOT).endsWith(".dex");
             if (source.name.toLowerCase(Locale.ROOT).endsWith(".arsc")) {
                 synchronized (workspaceLock) { sourceRevision = store.fingerprint(source); }
                 return null;
             }
-            File dir = Files.createTempDirectory(getCacheDir().toPath(), "archive-").toFile();
+            File dir = workspace.create(getCacheDir());
             File copy = new File(dir, source.name.replace('/', '_'));
             synchronized (workspaceLock) {
-                try {
-                    sourceRevision = copySource(copy, false, "");
-                    archive = copy;
-                } catch (Exception error) {
-                    try(var paths=Files.walk(dir.toPath())){for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
-                    catch(IOException cleanup){error.addSuppressed(cleanup);}throw error;
-                }
+                sourceRevision = copySource(copy, false, "");
+                archive = copy;
             }
             return copy;
         }, copy -> {
@@ -145,7 +168,31 @@ public class ArchiveActivity extends LabActivity {
                 browser.setVisibility(View.GONE); scroll.setVisibility(View.VISIBLE); tools.setVisibility(View.VISIBLE); dexEntry = "";
                 dexBrowser("");
             } else reload();
-        });
+            archiveReady = true;
+            observeExtraction();
+            finishPicker();
+        }, error -> { workspace.close(); Tasks.showError(this, error); });
+    }
+    private <T> void runWorkspace(Tasks.Job<T> work, Tasks.Done<T> done) {
+        runWorkspace(work, done, error -> Tasks.showError(this, error));
+    }
+    private <T> void runWorkspace(Tasks.Job<T> work, Tasks.Done<T> done, Tasks.Done<Exception> failed) {
+        Tasks.run(this, workspace, work, done, failed);
+    }
+    @Override protected void onDestroy() {
+        operationHandler.removeCallbacks(extractionTick);
+        if (operationProgress != null) operationProgress.clear();
+        workspace.close();
+        super.onDestroy();
+    }
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString("archivePrefix", prefix);
+        state.putInt("archivePicker", pickerRequest);
+        state.putString("pickerPrefix", pickerPrefix);
+        state.putString("pickerEntry", pickerEntry);
+        state.putString("pickerRevision", pickerRevision);
+        state.putParcelable("pickerResult", pickerResult);
     }
     private final class ArchiveRow {
         final LinearLayout row = Ui.row(ArchiveActivity.this);
@@ -217,7 +264,7 @@ public class ArchiveActivity extends LabActivity {
         long started = SystemClock.uptimeMillis();
         if (readSource) refresh.setRefreshing(true);
         String current = prefix;
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             synchronized (workspaceLock) {
                 if (readSource) sourceRevision = copySource(archive, true, current);
                 return rawDex ? Collections.<ArchiveOps.Item>emptyList() : ArchiveOps.list(archive, current);
@@ -235,7 +282,7 @@ public class ArchiveActivity extends LabActivity {
     }
     private void refreshChangedSource() {
         if (archive == null || busy) return;
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             synchronized (workspaceLock) { return splitZip || !Objects.equals(sourceRevision, store.fingerprint(source)); }
         }, changed -> { if (changed) reload(true); });
     }
@@ -262,7 +309,7 @@ public class ArchiveActivity extends LabActivity {
                 Intent preview = new Intent(this, PreviewActivity.class); entry.put(preview);
                 preview.putExtra("kind", kind); startActivity(preview); return;
             }
-            Tasks.run(this, () -> {
+            runWorkspace(() -> {
                 synchronized (workspaceLock) {
                     if (sourceRevision == null) throw revisionConflict();
                     Intent editor = new Intent(this, EditorActivity.class); entry.put(editor);
@@ -275,7 +322,7 @@ public class ArchiveActivity extends LabActivity {
         if (name.endsWith(".dex")) { dexEntry = item.path(); dexBrowser(item.path()); return; }
         if (name.equals("resources.arsc")) { edit(item.path(), "arsc"); return; }
         if (name.endsWith(".xml")) {
-            Tasks.run(this, () -> {
+            runWorkspace(() -> {
                 synchronized (workspaceLock) {
                     boolean binary = ResXmlDocument.isResXmlBlock(ArchiveOps.bytes(archive, item.path(), EditorActivity.LIMIT));
                     return editorIntent(item.path(), binary ? "xml" : null);
@@ -292,7 +339,7 @@ public class ArchiveActivity extends LabActivity {
                 .putExtra("displayName", entry).putExtra("mode", mode).putExtra("sourceRevision", sourceRevision);
     }
     private void edit(String entry, String mode) {
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             synchronized (workspaceLock) { return editorIntent(entry, mode); }
         }, this::openEditor);
     }
@@ -306,7 +353,7 @@ public class ArchiveActivity extends LabActivity {
                         case 1 -> extract(item.path());
                         case 2 -> {
                             if (item.directory()) { Tasks.toast(this, "请选择文件"); return; }
-                            replacement = item.path(); pickImport();
+                            pickImport(item.path());
                         }
                         case 3 -> rename(item);
                         case 4 -> MaterialDialogs.builder(this).setTitle("删除 " + item.name() + "？")
@@ -348,45 +395,82 @@ public class ArchiveActivity extends LabActivity {
                     });
                 }).show();
     }
-    private void importFile() { replacement = null; pickImport(); }
-    private void pickImport() {
-        if (archive == null || busy) return;
-        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*")
-                .addCategory(Intent.CATEGORY_OPENABLE), IMPORT);
+    private void importFile() { pickImport(null); }
+    private void pickImport(String target) {
+        startPicker(IMPORT, target, new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*"));
+    }
+    private void startPicker(int request, String target, Intent intent) {
+        if (!archiveReady || busy || pickerRequest != 0) return;
+        pickerRequest = request;
+        pickerEntry = target;
+        pickerPrefix = prefix;
+        pickerRevision = sourceRevision;
+        try {
+            startActivityForResult(intent.addCategory(Intent.CATEGORY_OPENABLE), request);
+        } catch (ActivityNotFoundException error) {
+            clearPicker();
+            Tasks.showError(this, error);
+        }
+    }
+    private void clearPicker() {
+        pickerRequest = 0;
+        pickerResult = null;
+        pickerEntry = pickerRevision = pickerPrefix = null;
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request == EDIT) { if (result == RESULT_OK) reload(true); return; }
-        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        if (request == EDIT) { if (result == RESULT_OK && archiveReady) reload(true); return; }
+        if (request != IMPORT && request != OUTPUT) return;
+        if (request != pickerRequest) {
+            if (result == RESULT_OK) Tasks.toast(this, "原操作已失效，请重新选择文件");
+            return;
+        }
+        if (result != RESULT_OK || data == null || data.getData() == null) { clearPicker(); return; }
+        pickerResult = data.getData();
+        finishPicker();
+    }
+    private void finishPicker() {
+        if (!archiveReady || pickerResult == null) return;
+        String target = pickerEntry, current = pickerPrefix, expected = pickerRevision;
+        Uri document = pickerResult;
+        int request = pickerRequest;
+        clearPicker();
+        if (expected == null || current == null || !expected.equals(sourceRevision)) {
+            Tasks.showError(this, revisionConflict());
+            return;
+        }
         if (request == IMPORT) {
-            String target = replacement, current = prefix;
             change(() -> {
-                FileStore.Node imported = store.document(data.getData()); File file = store.materialize(imported);
-                try {
-                    String entry = target == null ? current + imported.name : target;
-                    if (target == null) {
-                        if (ArchiveOps.containsEntry(archive, entry))
+                if (!expected.equals(sourceRevision)) throw revisionConflict();
+                FileStore.Node imported = store.document(document);
+                String entry = target == null ? current + imported.name : target;
+                if (target == null && ArchiveOps.containsEntry(archive, entry))
                     throw new IOException("条目已存在，请使用“替换资源”");
-                    }
-                    ArchiveOps.rewrite(archive, null, null, Map.of(entry, file)); return true;
-                } finally { Files.deleteIfExists(file.toPath()); }
+                if (target != null && !ArchiveOps.containsEntry(archive, entry))
+                    throw new IOException("待替换的条目已不存在，请重新选择");
+                File file = store.materialize(imported);
+                try { ArchiveOps.rewrite(archive, null, null, Map.of(entry, file)); return true; }
+                finally { store.release(imported, file); }
             });
-        } else if (request == OUTPUT && pendingOutput != null) {
-            File file = pendingOutput;
-            Tasks.run(this, () -> {
-                try (InputStream in = new FileInputStream(file);
-                     OutputStream out = getContentResolver().openOutputStream(data.getData(), "wt")) {
-                    if (out == null) throw new IOException("输出不可写"); FileStore.pump(in, out);
+        } else if (request == OUTPUT) {
+            runWorkspace(() -> {
+                synchronized (workspaceLock) {
+                    if (!expected.equals(sourceRevision)) throw revisionConflict();
+                    try (InputStream in = new FileInputStream(archive);
+                         OutputStream out = getContentResolver().openOutputStream(document, "wt")) {
+                        if (out == null) throw new IOException("输出不可写");
+                        FileStore.pump(in, out);
+                    }
                 }
                 return true;
-            }, ok -> { Tasks.toast(this, "已导出"); pendingOutput = null; });
+            }, ok -> Tasks.toast(this, "已导出"));
         }
     }
     private <T> void change(Tasks.Job<T> job) {
         if (rar) { Tasks.toast(this, "此归档格式当前为只读浏览"); return; }
         if (busy) { Tasks.toast(this, "请等待当前操作"); return; }
         busy = true; refresh.setEnabled(false); summary.setText("处理并写回中…");
-        Tasks.run(this, () -> applyChange(job), result -> {
+        runWorkspace(() -> applyChange(job), result -> {
             finishChange(); Tasks.toast(this, "已写回原文件");
         }, error -> { finishChange(); Tasks.showError(this, error); });
     }
@@ -425,11 +509,41 @@ public class ArchiveActivity extends LabActivity {
     }
     private void extract(String entry) {
         if (archive == null || busy) return;
-        Tasks.run(this, () -> {
-            File dest = new File(outputDir(), source.name + "-extract-" + System.currentTimeMillis());
-            ArchiveOps.extract(archive, entry, dest); return dest;
-        }, this::showOutput);
+        Extraction operation;
+        synchronized (ArchiveActivity.class) {
+            if (activeExtraction != null && !activeExtraction.finished) { Tasks.toast(this, "请等待当前解压完成"); return; }
+            operation = new Extraction(source.key()); activeExtraction = operation;
+        }
+        busy = true; operationProgress.bind(operation.progress);
+        runWorkspace(() -> {
+            try {
+                operation.result = operation.progress.run(() -> {
+                    File dest = new File(outputDir(), source.name + "-extract-" + System.currentTimeMillis());
+                    ArchiveOps.extract(archive, entry, dest); return dest;
+                });
+            } catch (Exception error) { operation.error = error; }
+            finally { operation.finished = true; }
+            return operation.result;
+        }, ignored -> observeExtraction());
+        operationHandler.removeCallbacks(extractionTick); operationHandler.postDelayed(extractionTick, 250);
     }
+    private void observeExtraction() {
+        operationHandler.removeCallbacks(extractionTick);
+        if (!operationResumed || isDestroyed() || isFinishing() || source == null) return;
+        Extraction operation = activeExtraction;
+        if (operation == null || !source.key().equals(operation.sourceKey)) return;
+        if (!operation.finished) {
+            busy = true; operationProgress.bind(operation.progress);
+            operationHandler.postDelayed(extractionTick, 250); return;
+        }
+        synchronized (ArchiveActivity.class) { if (activeExtraction != operation) return; activeExtraction = null; }
+        busy = false; operationProgress.clear();
+        if (operation.error instanceof Tasks.CancelledException) Tasks.toast(this, "解压已停止");
+        else if (operation.error != null) Tasks.showError(this, operation.error);
+        else if (operation.result != null) showOutput(operation.result);
+    }
+    @Override protected void onPause() { operationResumed = false; operationHandler.removeCallbacks(extractionTick); super.onPause(); }
+    @Override protected void onResume() { super.onResume(); operationResumed = true; observeExtraction(); }
     private void showOutput(File file) {
         MaterialDialogs.builder(this).setTitle("已输出").setMessage(file.getAbsolutePath())
                 .setNegativeButton("关闭", null).setPositiveButton(file.isDirectory() ? "打开目录" : "浏览输出目录", (d, w) -> {
@@ -447,7 +561,7 @@ public class ArchiveActivity extends LabActivity {
         if (rar) { Tasks.toast(this, "此归档格式支持浏览、查看和解压"); return; }
         if (rawDex && n != 3 && n != 4 && n != 5 && n != 10 && n != 0) { Tasks.toast(this, "此操作需要 APK"); return; }
         switch (n) {
-            case 0 -> Tasks.run(this, () -> metadata(), text -> message("文件信息", text));
+            case 0 -> runWorkspace(() -> metadata(), text -> message("文件信息", text));
             case 1 -> edit("AndroidManifest.xml", "xml");
             case 2 -> edit("resources.arsc", "arsc");
             case 3 -> chooseDex(this::dexBrowser);
@@ -455,9 +569,9 @@ public class ArchiveActivity extends LabActivity {
             case 5 -> chooseDex(this::assemble);
             case 6 -> outputApk(true, false, null);
             case 7 -> outputApk(false, false, null);
-            case 8 -> Tasks.run(this, () -> ApkTools.verify(archive), text -> message("APK 签名", text));
+            case 8 -> runWorkspace(() -> ApkTools.verify(archive), text -> message("APK 签名", text));
             case 9 -> cloneDialog();
-            case 10 -> export(archive, source.name);
+            case 10 -> export();
         }
     }
     private String metadata() throws Exception {
@@ -478,7 +592,7 @@ public class ArchiveActivity extends LabActivity {
     private interface DexAction { void run(String entry); }
     private void chooseDex(DexAction action) {
         if (rawDex) { action.run(""); return; }
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             List<String> names = new ArrayList<>();
             for (String name : ArchiveOps.entryNames(archive)) if (name.endsWith(".dex")) names.add(name);
             Collections.sort(names); return names;
@@ -520,7 +634,7 @@ public class ArchiveActivity extends LabActivity {
     }
     private void disassemble(String entry) {
         busy = true; summary.setText("DEX 反汇编中…");
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             try {
                 synchronized (workspaceLock) {
                     requireRevision();
@@ -550,7 +664,7 @@ public class ArchiveActivity extends LabActivity {
                 })).show();
     }
     private void dexBrowser(String entry) {
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             synchronized (workspaceLock) {
                 List<String> names = new ArrayList<>();
                 for (ClassDef def : DexFileFactory.loadDexFile(dexFile(entry), Opcodes.getDefault()).getClasses()) names.add(def.getType());
@@ -569,7 +683,7 @@ public class ArchiveActivity extends LabActivity {
                     .setView(body).setNegativeButton("关闭", null).setPositiveButton("反汇编到工作区", (d, w) -> disassemble(entry)).create();
             classes.setOnItemClickListener((p, v, pos, id) -> {
                 String descriptor = adapter.getItem(pos);
-                Tasks.run(this, () -> classPreview(entry, descriptor), preview -> openEditor(
+                runWorkspace(() -> classPreview(entry, descriptor), preview -> openEditor(
                         classEditorIntent(entry, descriptor, preview)));
             }); dialog.show();
         });
@@ -599,7 +713,7 @@ public class ArchiveActivity extends LabActivity {
         for (File f : children) if (f.isDirectory()) collectSmali(f, out); else if (f.getName().endsWith(".smali")) out.add(f);
     }
     private void cloneDialog() {
-        Tasks.run(this, () -> ApkTools.packageName(archive), old -> {
+        runWorkspace(() -> ApkTools.packageName(archive), old -> {
             EditText input = Ui.input(this, "新包名"); input.setText(old + ".clone");
             MaterialDialogs.builder(this).setTitle("制作共存 APK").setView(input).setNegativeButton("取消", null)
                     .setPositiveButton("制作并签名", (d, w) -> outputApk(true, true, input.getText().toString())).show();
@@ -607,7 +721,7 @@ public class ArchiveActivity extends LabActivity {
     }
     private void outputApk(boolean sign, boolean clone, String packageName) {
         if (busy) return; busy = true; summary.setText(sign ? "对齐并签名中…" : "对齐中…");
-        Tasks.run(this, () -> {
+        runWorkspace(() -> {
             try {
                 String base = source.name.replaceFirst("(?i)\\.apk(?:\\.1)?$", "");
                 File unsigned = File.createTempFile("aligned-", ".apk", getCacheDir());
@@ -620,10 +734,9 @@ public class ArchiveActivity extends LabActivity {
             } finally { runOnUiThread(() -> busy = false); }
         }, this::showOutput);
     }
-    private void export(File file, String name) {
-        pendingOutput = file;
-        startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/octet-stream")
-                .addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE, name), OUTPUT);
+    private void export() {
+        startPicker(OUTPUT, null, new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/octet-stream")
+                .putExtra(Intent.EXTRA_TITLE, source.name));
     }
     @Override protected void handleBack() {
         if (busy) { Tasks.toast(this, "当前操作正在执行"); return; }

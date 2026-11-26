@@ -63,6 +63,38 @@ public class EditorResponsivenessInstrumentedTest {
             });
         }
     }
+    @Test public void largeEncryptedZipEntryOpensInPagedEditor() throws Exception {
+        File zip = new File(work, "encrypted.zip");
+        char[] password = "editor-test".toCharArray();
+        String name = "long.txt";
+        byte[] line = "A line of text for the paged archive editor.\n".getBytes(StandardCharsets.UTF_8);
+        int lines = 33_000;
+        try (var output = new net.lingala.zip4j.io.outputstream.ZipOutputStream(Files.newOutputStream(zip.toPath()), password)) {
+            var entry = new net.lingala.zip4j.model.ZipParameters();
+            entry.setFileNameInZip(name);
+            entry.setEncryptFiles(true);
+            entry.setEncryptionMethod(net.lingala.zip4j.model.enums.EncryptionMethod.AES);
+            output.putNextEntry(entry);
+            for (int i = 0; i < lines; i++) output.write(line);
+            output.closeEntry();
+        }
+        var display = context.getSharedPreferences("editor-display", 0);
+        boolean hadLimit = display.contains("paging-mib");
+        int limit = display.getInt("paging-mib", 2);
+        display.edit().putInt("paging-mib", 1).commit();
+        ArchiveOps.setPassword(zip, password);
+        try (ActivityScenario<EditorActivity> scenario = ActivityScenario.launch(intent(zip).putExtra("archiveEntry", name))) {
+            awaitLoaded(scenario);
+            scenario.onActivity(activity -> {
+                assertTrue((boolean) get(activity, "paged"));
+                assertEquals((long) line.length * lines, ((File) get(activity, "pageFile")).length());
+            });
+        } finally {
+            ArchiveOps.clearPassword(zip);
+            if (hadLimit) display.edit().putInt("paging-mib", limit).commit();
+            else display.edit().remove("paging-mib").commit();
+        }
+    }
     /** Loading itself must not block the main thread while the binary page is decoded. */
     @Test public void denseBinaryPayloadLoadsWithoutLongMainThreadStalls() throws Exception {
         File sample = binaryFixture(new File(work, "payload.sh"));

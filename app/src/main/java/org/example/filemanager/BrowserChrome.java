@@ -27,6 +27,7 @@ final class BrowserChrome extends FrameLayout {
     private final Insets listInsets;
     private View statusGuard;
     private InlineFilterBar filter;
+    private OperationProgressView progress;
     private boolean frost,leftActive=true,watching;
     private int gap;
     private Consumer<Boolean> blurListener;
@@ -48,12 +49,15 @@ final class BrowserChrome extends FrameLayout {
     private int headerSize(){return frost?Math.max(dp(64),normalHeight+dp(6)):normalHeight;}
     private int dockSize(){return frost?Math.max(dp(54),Math.round(dp(35)+Ui.dp(getContext(),17)*getResources().getConfiguration().fontScale)):dp(50)+gap;}
     private int bottomMargin(){return frost?Math.max(dp(8),gap):0;}
+    void progress(OperationProgressView value) { progress=value; addView(value,new LayoutParams(-1,-2)); requestLayout(); }
     private void measure(View v,int w,int h){v.measure(MeasureSpec.makeMeasureSpec(Math.max(0,w),MeasureSpec.EXACTLY),MeasureSpec.makeMeasureSpec(Math.max(0,h),MeasureSpec.EXACTLY));}
     @Override protected void onMeasure(int ws,int hs){
         int w=MeasureSpec.getSize(ws),h=MeasureSpec.getSize(hs);setMeasuredDimension(w,h);
         int head=headerSize(),dock=dockSize(),b=bottomMargin();
         int perm=permission.getVisibility()==GONE?0:dp(48),msg=status.getVisibility()==GONE?0:dp(48);
-        int top=frost&&perm==0?0:head+perm, bottom=frost&&msg==0?0:dock+b+msg+(frost?0:dp(1));
+        int operation=0;
+        if(progress!=null&&progress.getVisibility()!=GONE){progress.measure(MeasureSpec.makeMeasureSpec(w,MeasureSpec.EXACTLY),MeasureSpec.makeMeasureSpec(h/3,MeasureSpec.AT_MOST));operation=progress.getMeasuredHeight();}
+        int top=frost&&perm==0?0:head+perm, bottom=frost&&msg==0&&operation==0?0:dock+b+msg+operation+(frost?0:dp(1));
         int gutter=frost?Math.max(0,Math.min(dp(16),(w-5*dp(48)-dp(6))/2)):0;
         listInsets.set(top==0&&frost?head:0,bottom==0&&frost?dock+b+dp(6):0);
         measure(panes,w,h-top-bottom);measure(header,w,head);measure(permission,w,perm);measure(status,w,msg);
@@ -63,10 +67,11 @@ final class BrowserChrome extends FrameLayout {
     private void place(View v,int x,int y){v.layout(x,y,x+v.getMeasuredWidth(),y+v.getMeasuredHeight());}
     @Override protected void onLayout(boolean changed,int l,int t,int r,int b){
         int w=r-l,h=b-t,head=header.getMeasuredHeight(),dockY=h-actions.getMeasuredHeight()-bottomMargin();
-        int perm=permission.getMeasuredHeight(),msg=status.getMeasuredHeight();
+        int perm=permission.getMeasuredHeight(),msg=status.getMeasuredHeight(),operation=progress==null||progress.getVisibility()==GONE?0:progress.getMeasuredHeight();
         place(panes,0,frost&&perm==0?0:head+perm);place(header,0,0);place(topSample,0,0);place(permission,0,head);
         place(leftEdge,0,head-dp(2));place(rightEdge,w/2,head-dp(2));
-        place(status,0,dockY-msg-(frost?0:dp(1)));place(divider,0,dockY-dp(1));
+        if(operation>0)place(progress,0,dockY-operation-(frost?0:dp(1)));
+        place(status,0,dockY-operation-msg-(frost?0:dp(1)));place(divider,0,dockY-dp(1));
         place(actions,(w-actions.getMeasuredWidth())/2,dockY);place(bottomSample,0,dockY);
         if(changed)refreshGlass();
     }

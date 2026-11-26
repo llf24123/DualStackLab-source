@@ -159,7 +159,7 @@ public class SearchActivity extends LabActivity {
         style(modeChip, contents); style(regexChip, regex); style(caseChip, caseSensitive);
         style(hiddenChip, hidden); style(scopeChip, shared);
         if (job == null && nodes.isEmpty()) empty.setText(contents
-                ? "在常见文本文件中查找内容，每个文件只读取前 2 MiB"
+                ? "在常见文本文件中查找内容；普通关键词分块搜索完整文件，其他正则受单行 1 Mi 或全文 8 Mi 字符及匹配耗时限制，超限会提示"
                 : "按文件名搜索，包含所有子目录");
     }
     private void style(TextView chip, boolean on) {
@@ -274,10 +274,12 @@ public class SearchActivity extends LabActivity {
         progress.setText(status + " · " + nodes.size() + " 项 · 已检查 " + state.scanned()
                 + (state.denied() == 0 ? "" : " · 跳过 " + state.denied())
                 + (nodes.size() >= SearchJob.LIMIT ? " · 达到 " + SearchJob.LIMIT + " 项上限" : "")
-                + (state.error() == null ? "" : " · " + state.error()));
+                + (state.error() == null ? "" : " · " + state.error())
+                + (state.notice() == null ? "" : " · " + state.notice()));
         history.removeAllViews();
         empty.setText(running ? "正在查找“" + job.query + "”…" : "没有找到“" + job.query + "”" +
-                (job.contents ? "\n仅检查常见文本文件，大文件按行匹配" : "\n可改用内容搜索或关闭区分大小写"));
+                (job.contents ? "\n仅检查常见文本文件；普通关键词分块搜索完整文件，其他正则受单行 1 Mi 或全文 8 Mi 字符及匹配耗时限制，超限会提示" : "\n可改用内容搜索或关闭区分大小写")
+                + (state.notice() == null ? "" : "\n" + state.notice()));
     }
     private void open(FileStore.Node node) {
         Intent intent = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);

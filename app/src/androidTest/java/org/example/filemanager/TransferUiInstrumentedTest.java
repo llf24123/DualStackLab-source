@@ -81,9 +81,12 @@ public class TransferUiInstrumentedTest {
                 method.invoke(activity, List.of(node), source, destination, move);
             } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
         });
-        UiObject2 keepBoth = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
-                .wait(Until.findObject(By.text("自动改名保留")), 1500);
-        if (keepBoth != null) keepBoth.click();
+        if (!output.equals(node.name)) {
+            UiObject2 keepBoth = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+                    .wait(Until.findObject(By.desc("同名处理 另存")), 5000);
+            assertNotNull("同目录复制必须先确认另存一份", keepBoth);
+            keepBoth.click();
+        }
         boolean[] done = {false}; long until = SystemClock.uptimeMillis() + 10000;
         while (!done[0] && SystemClock.uptimeMillis() < until) {
             screen.onActivity(activity -> done[0] = !(Boolean) get(activity, "busy") && hasRow(get(activity, "right"), output));

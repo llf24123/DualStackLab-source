@@ -56,8 +56,7 @@ public class CopyExperienceInstrumentedTest {
                 } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
             });
             assertTrue(started.await(2, TimeUnit.SECONDS)); SystemClock.sleep(800);
-            assertFalse(device.hasObject(By.text("正在处理")));
-            assertFalse(device.hasObject(By.desc("操作进度")));
+            assertFalse("Copy must not open the old modal progress dialog", device.hasObject(By.text("正在处理")));
             find(By.desc("左窗口文件列表"));
         } finally { release.countDown(); freeIo.countDown(); assertTrue(ended.await(5, TimeUnit.SECONDS)); }
     }

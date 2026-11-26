@@ -234,7 +234,7 @@ public class EditorActivity extends LabActivity {
     private void own(File file) { session.own(file); }
     private String fingerprint() throws IOException { return store.fingerprint(source); }
     private void prepareArchive() throws IOException {
-        if (archive == null) return;
+        if (archive == null && entry == null) return;
         if (session.archive != null && session.archive.isFile()) { archive = session.archive; return; }
         File original = archive;
         File copy = File.createTempFile("editor-archive-", "-" + source.name.replaceAll("[^a-zA-Z0-9.]", "_"), getCacheDir());
@@ -242,7 +242,7 @@ public class EditorActivity extends LabActivity {
         try (InputStream input = store.read(source); OutputStream output = new FileOutputStream(copy)) { FileStore.pump(input, output); }
         if (source.file != null) ArchiveOps.copyPassword(source.file, copy);
         archive = copy; session.archive = copy;
-        if (getIntent().getBooleanExtra("ownedArchive", false)) { own(original); session.ownParent(original.getParentFile()); }
+        if (original != null && getIntent().getBooleanExtra("ownedArchive", false)) { own(original); session.ownParent(original.getParentFile()); }
     }
     private LinearLayout.LayoutParams lp(int w, int h) {
         return new LinearLayout.LayoutParams(w < 0 ? w : Ui.dp(this, w), h < 0 ? h : Ui.dp(this, h));
@@ -323,7 +323,9 @@ public class EditorActivity extends LabActivity {
                 long size = ArchiveOps.entrySize(archive, entry);
                 if (size < 0) throw new IOException("归档条目不存在");
                 if (size <= pagingLimit()) return ArchiveOps.bytes(archive, entry, pagingLimit());
-                pageFile = File.createTempFile("large-entry-", ".txt", getCacheDir());
+                File directory = Files.createTempDirectory(getCacheDir().toPath(), "large-entry-").toFile();
+                session.ownParent(directory);
+                pageFile = new File(directory, "entry.txt");
                 own(pageFile);
                 ArchiveOps.extractOne(archive, entry, pageFile);
             } else {

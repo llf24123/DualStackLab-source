@@ -65,11 +65,25 @@ public class DirectorySheetLayoutInstrumentedTest {
     @Test public void portraitPanelKeepsFooterAboveNavigationAndLastBookmarkReachable() {
         open(); assertFits();
         device.waitForIdle();
-        for (int i = 0; i < 16 && !device.hasObject(By.text("bookmark-27")); i++) {
-            find(By.desc("最近与书签列表")).scroll(Direction.DOWN, .9f);
-            device.waitForIdle();
+        Rect bounds = new Rect();
+        int[] visible = new int[2];
+        for (int i = 0; i < 64; i++) {
+            scenario.onActivity(activity -> {
+                ListView list = (ListView) get(get(activity, "sheet"), "list");
+                int[] origin = new int[2];
+                list.getLocationOnScreen(origin);
+                bounds.set(origin[0], origin[1], origin[0] + list.getWidth(), origin[1] + list.getHeight());
+                visible[0] = list.getLastVisiblePosition();
+                visible[1] = list.getCount();
+            });
+            if (visible[0] == visible[1] - 1) break;
+            int margin = Math.max(1, bounds.height() / 10);
+            assertTrue(device.swipe(bounds.centerX(), bounds.bottom - margin,
+                    bounds.centerX(), bounds.top + margin, 22));
+            SystemClock.sleep(160);
         }
-        find(By.text("bookmark-27")); assertFits();
+        assertEquals("Visible end of the bookmark list", visible[1] - 1, visible[0]);
+        find(By.desc("目录快捷项 bookmark-27")); assertFits();
         capture("bookmarks-portrait-last-entry.png");
         find(By.desc("收起最近与书签")).click();
         assertTrue(device.wait(Until.gone(By.desc("最近与书签面板")), 5000));
@@ -108,6 +122,7 @@ public class DirectorySheetLayoutInstrumentedTest {
                     ? insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()).bottom
                     : insets.getSystemWindowInsetBottom();
             View close = findView(body, "收起最近与书签"); assertNotNull(close);
+            assertTrue(close.getGlobalVisibleRect(safe));
             assertTrue("Down chevron overlaps navigation bar: " + safe + " screen=" + decor.getHeight()
                     + " bar=" + bottom, safe.bottom <= decor.getHeight() - bottom);
             assertTrue(visible.right <= decor.getWidth()); assertTrue(visible.top >= 0);

@@ -41,6 +41,7 @@ public class CountingDocumentsProvider extends DocumentsProvider {
     private String failCreateName, failReadName, renameName, collideName, blockReadName, failDeleteName;
     private String failReadAfterPrefixName, truncateWriteName, corruptWriteName, corruptOnNextRead;
     private String failRenameName;
+    private String opaqueReadName;
     private int writeTruncateBytes = 3;
     private ReadGate readGate;
     private String blockDeleteName;
@@ -120,6 +121,7 @@ public class CountingDocumentsProvider extends DocumentsProvider {
                                                                     CancellationSignal signal) throws FileNotFoundException {
         File file = resolve(documentId);
         if (mode.equals("r")) readOpens++; else writeOpens++;
+        if (mode.equals("r") && file.getName().equals(opaqueReadName)) return opaqueReadPipe(file);
         if (mode.equals("r") && file.getName().equals(alternateReadName) && ++alternateReadHits == alternateReadAt) {
             try {
                 byte[] bytes = Files.readAllBytes(file.toPath()); if (bytes.length > 0) bytes[0] ^= 1;
@@ -146,7 +148,8 @@ public class CountingDocumentsProvider extends DocumentsProvider {
         if (!mode.equals("r") && file.getName().equals(corruptWriteName)) corruptOnNextRead = file.getName();
         if (mode.equals("r") && file.getName().equals(failReadName))
             throw new FileNotFoundException("Injected read failure");
-        if (mode.equals("r") && file.getName().equals(failReadAfterPrefixName)) return failedReadPipe(file);
+        if (mode.equals("r") && (file.getName().equals(failReadAfterPrefixName)
+                || documentId.equals(failReadAfterPrefixName))) return failedReadPipe(file);
         if (mode.equals("r") && file.getName().equals(blockReadName)) {
             blockReadName = null;
             try {
@@ -184,6 +187,19 @@ public class CountingDocumentsProvider extends DocumentsProvider {
                 try { descriptor.close(); } catch (IOException ignored) { }
             throw failure(new IOException(error));
         }
+    }
+    private static ParcelFileDescriptor opaqueReadPipe(File file) throws FileNotFoundException {
+        try {
+            ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+            Thread writer = new Thread(() -> {
+                try (InputStream input = new FileInputStream(file);
+                     OutputStream output = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
+                    byte[] bytes = new byte[128 * 1024]; int count;
+                    while ((count = input.read(bytes)) != -1) output.write(bytes, 0, count);
+                } catch (IOException closedReader) { /* Identity checks may close the pipe without reading it. */ }
+            }, "opaque-copy-fixture-pipe");
+            writer.setDaemon(true); writer.start(); return pipe[0];
+        } catch (IOException error) { throw failure(error); }
     }
     @Override public void deleteDocument(String documentId) throws FileNotFoundException {
         File file;
@@ -243,6 +259,7 @@ public class CountingDocumentsProvider extends DocumentsProvider {
                     writeTruncateBytes = 3;
                     alternateReadName = null; alternateReadAt = 2; alternateReadHits = 0;
                     failRenameName = null;
+                    opaqueReadName = null;
                     Uri tree = DocumentsContract.buildTreeDocumentUri(AUTHORITY, "root");
                     getContext().grantUriPermission(BuildConfig.APPLICATION_ID, tree,
                             Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -271,6 +288,7 @@ public class CountingDocumentsProvider extends DocumentsProvider {
                 }
                 case "releaseDelete" -> { if (deleteGate != null) deleteGate.released.countDown(); }
                 case "configure" -> {
+                    opaqueReadName = extras.getString("opaqueReadName");
                     failRenameName = extras.getString("failRenameName");
                     alternateReadName = extras.getString("alternateReadName"); alternateReadAt = extras.getInt("alternateReadAt", 2); alternateReadHits = 0;
                     failCreateName = extras.getString("failCreateName");

@@ -19,7 +19,8 @@ public class SplitInstallActivity extends LabActivity {
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private TextView status;
     private int sessionId = -1;
-    private boolean working, waitingPermission, committed;
+    private boolean working, waitingPermission, committed, rootInstall;
+    private volatile ShellRunner privilegedRunner;
     private SplitApks.Prepared preview;
     private ApksTargeting.Profile profile = ApksTargeting.Profile.AUTOMATIC;
     private LinearLayout body;
@@ -76,7 +77,19 @@ public class SplitInstallActivity extends LabActivity {
     }
     private void begin() {
         if (working) return;
-        if (!getPackageManager().canRequestPackageInstalls()) {
+        working = true;
+        Tasks.SHELL.execute(() -> {
+            boolean root = RootAccess.available();
+            runOnUiThread(() -> {
+                if (cancelled.get() || isFinishing() || isDestroyed()) { working = false; return; }
+                rootInstall = root;
+                beginResolved();
+            });
+        });
+    }
+    private void beginResolved() {
+        if (!rootInstall && !getPackageManager().canRequestPackageInstalls()) {
+            working = false;
             MaterialDialogs.builder(this).setTitle("允许安装应用")
                     .setMessage("请在系统设置中允许双栈 Lab 安装应用，返回后继续安装。")
                     .setNegativeButton("取消", (d, w) -> finish()).setOnCancelListener(d -> finish())
@@ -87,8 +100,7 @@ public class SplitInstallActivity extends LabActivity {
                     }).show();
             return;
         }
-        working = true;
-        if(single!=null){status.setText("正在交给系统安装器…");writeAndCommit(null);return;}
+        if(single!=null){status.setText(rootInstall?"正在通过 ROOT 静默安装 APK…":"正在交给系统安装器…");writeAndCommit(null);return;}
         ApksTargeting.Profile requested = profile;
         Tasks.SHELL.execute(() -> {
             try {
@@ -191,13 +203,30 @@ public class SplitInstallActivity extends LabActivity {
         install.setOnClickListener(v -> {
             try { SplitApks.retainSelection(prepared, selection); }
             catch (IOException error) { error(error.getMessage()); return; }
-            install.setEnabled(false); preview = null; status.setText(message + "\n正在交给系统安装器…");
+            install.setEnabled(false); preview = null; status.setText(message + (rootInstall
+                    ? "\n正在通过 ROOT 静默安装所选分包…" : "\n正在交给系统安装器…"));
             writeAndCommit(prepared);
         });
     }
     private void writeAndCommit(SplitApks.Prepared prepared) {
         Tasks.SHELL.execute(()->{
             try(SplitApks.Prepared owned=prepared){
+                if (rootInstall) {
+                    ShellRunner runner = new ShellRunner(); privilegedRunner = runner;
+                    try {
+                        if (cancelled.get()) return;
+                        if (owned == null) ApkInstall.silent(single, runner);
+                        else SplitApks.installSilently(owned.parts.stream().map(SplitApks.Part::file).toList(),
+                                SplitApks.currentUserId(), cancelled, runner);
+                        runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed()) {
+                                if (single != null) ApkInstall.discardStage(this, single);
+                                Tasks.toast(this, "安装成功"); finish();
+                            }
+                        });
+                    } finally { privilegedRunner = null; }
+                    return;
+                }
                 int ready=owned==null?SplitApks.writeSingleSession(this,single,cancelled):SplitApks.writeSession(this,owned,cancelled);
                 runOnUiThread(()->{
                     if(cancelled.get()||isFinishing()||isDestroyed()){
@@ -253,6 +282,8 @@ public class SplitInstallActivity extends LabActivity {
     }
     @Override protected void onDestroy() {
         cancelled.set(true);
+        ShellRunner runner = privilegedRunner;
+        if (runner != null && isFinishing()) Tasks.CONTROL.execute(runner::stop);
         if (preview != null) { SplitApks.Prepared close = preview; preview = null; Tasks.IO.execute(close::close); }
         if (isFinishing()){abandon();ApkInstall.discardStage(this,single);}
         super.onDestroy();

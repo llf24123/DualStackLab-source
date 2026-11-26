@@ -1,6 +1,7 @@
 package org.example.filemanager;
 
 import android.os.Bundle;
+import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.system.Os;
@@ -42,19 +43,35 @@ public final class ShizukuDataService extends IDataAccess.Stub {
         try { return metadata(checked(path)); }
         catch (Exception error) { throw failure(error); }
     }
-    @Override public Bundle list(String path, int offset) throws RemoteException {
+    @Override public IDataListing list(String path) throws RemoteException {
         try {
-            if (offset < 0) throw new IOException("目录分页参数无效");
             File[] files = checked(path).listFiles();
             if (files == null) throw new IOException("Shizuku 无法读取此目录，请检查系统权限");
             Arrays.sort(files, Comparator.comparing(File::getName));
+            return new IDataListing.Stub() {
+                @Override public Bundle page(int offset) { return listingPage(files, offset); }
+            };
+        } catch (Exception error) { throw failure(error); }
+    }
+    private static Bundle listingPage(File[] files, int offset) {
+        try {
+            if (offset < 0 || offset > files.length) throw new IOException("目录分页参数无效");
             ArrayList<Bundle> entries = new ArrayList<>();
-            int end = Math.min(files.length, offset + 128);
-            for (int index = offset; index < end; index++) {
-                File file = files[index];
-                if (Files.isSymbolicLink(file.toPath())) continue;
-                try { entries.add(metadata(checked(file.getPath()))); }
-                catch (NoSuchFileException removed) { /* A concurrent removal need not fail the whole directory. */ }
+            // Binder's shared transaction buffer is bounded by bytes, not the number of files.
+            // Deep Android/data paths can make even 128 metadata records exceed that buffer.
+            int end = offset, bytes = 1024;
+            while (end < files.length && end < offset + 128) {
+                File file = files[end];
+                if (Files.isSymbolicLink(file.toPath())) { end++; continue; }
+                Bundle info;
+                try { info = metadata(checked(file.getPath())); }
+                catch (NoSuchFileException removed) { end++; continue; }
+                Parcel encoded = Parcel.obtain();
+                int size;
+                try { encoded.writeBundle(info); size = encoded.dataSize(); }
+                finally { encoded.recycle(); }
+                if (!entries.isEmpty() && bytes + size > 192 * 1024) break;
+                entries.add(info); bytes += size; end++;
             }
             Bundle page = new Bundle(); page.putParcelableArrayList("entries", entries);
             page.putInt("next", end < files.length ? end : -1); return page;

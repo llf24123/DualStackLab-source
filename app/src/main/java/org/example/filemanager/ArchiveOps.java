@@ -97,7 +97,7 @@ final class ArchiveOps {
         if (password != null && password.length > 0) setPassword(archive, password);
     }
     static List<Item> list(File file, String prefix) throws IOException {
-        synchronized (lock(file)) { return listLocked(file, prefix); }
+        synchronized (lock(file)) { return listLocked(file, prefix.isEmpty() ? prefix : zipPath(prefix)); }
     }
     private static List<Item> listLocked(File file, String prefix) throws IOException {
         if (isRar(file)) return cachedFolder(file, prefix, () -> RarArchiveOps.list(file, prefix));
@@ -126,6 +126,7 @@ final class ArchiveOps {
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
                 String path = zipPath(entry.getName());
+                if (path.isEmpty()) continue; // Conventional ./ root directory marker.
                 if (!names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 String parent = "";
                 String[] pieces = path.split("/");
@@ -236,6 +237,7 @@ final class ArchiveOps {
         try (net.lingala.zip4j.ZipFile zip = new net.lingala.zip4j.ZipFile(file)) {
             for (FileHeader header : zip.getFileHeaders()) {
                 String path = zipPath(header.getFileName());
+                if (path.isEmpty()) continue;
                 if (!names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 boolean directory = header.isDirectory() || path.endsWith("/");
                 validateEntry(directory && path.endsWith("/") ? path.substring(0, path.length() - 1) : path);
@@ -265,10 +267,11 @@ final class ArchiveOps {
             Enumeration<? extends ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement(); String path = zipPath(entry.getName());
+                if (path.isEmpty()) continue;
+                if (!names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 if (!path.startsWith(prefix) || path.equals(prefix)) continue;
                 String suffix = path.substring(prefix.length()); int slash = suffix.indexOf('/');
                 boolean folder = slash >= 0 || path.endsWith("/");
-                if (!folder && !names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 String name = slash >= 0 ? suffix.substring(0, slash) : suffix;
                 if (name.isEmpty()) continue;
                 String key = prefix + name + (folder ? "/" : "");
@@ -304,12 +307,24 @@ final class ArchiveOps {
         }
         if (isRar(file)) return RarArchiveOps.entryNames(file);
         List<String> names = new ArrayList<>();
-        if(isSplitZip(file)||isEncryptedZip(file)){try(net.lingala.zip4j.ZipFile zip=new net.lingala.zip4j.ZipFile(file)){for(FileHeader header:zip.getFileHeaders())names.add(zipPath(header.getFileName()));}return names;}
+        Set<String> seen = new HashSet<>();
+        if (isSplitZip(file) || isEncryptedZip(file)) {
+            try (net.lingala.zip4j.ZipFile zip = new net.lingala.zip4j.ZipFile(file)) {
+                for (FileHeader header : zip.getFileHeaders()) addEntryName(names, seen, header.getFileName());
+            }
+            return names;
+        }
         try (ZipFile zip = new ZipFile(file)) {
             Enumeration<? extends ZipEntry> entries = zip.entries();
-            while (entries.hasMoreElements()) names.add(zipPath(entries.nextElement().getName()));
+            while (entries.hasMoreElements()) addEntryName(names, seen, entries.nextElement().getName());
         }
         return names;
+    }
+    private static void addEntryName(List<String> names, Set<String> seen, String raw) throws IOException {
+        String path = zipPath(raw);
+        if (path.isEmpty()) return;
+        if (!seen.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
+        names.add(path);
     }
     static byte[] bytes(File file, String entry, int limit) throws IOException {
         try (InputStream in = openEntry(file, entry)) {
@@ -366,7 +381,7 @@ final class ArchiveOps {
             if (zip != null) {
                 String raw = rawName(entry); ZipEntry item = raw == null ? null : zip.getEntry(raw);
                 if (item == null || entry.endsWith("/")) throw new MissingEntry();
-                return zip.getInputStream(item);
+                return checkedZipStream(zip, item);
             }
             if (encryptedZip != null) {
                 String raw = rawName(entry); FileHeader header = raw == null ? null : encryptedZip.getFileHeader(raw);
@@ -399,13 +414,13 @@ final class ArchiveOps {
                     : encryptedZip.getFileHeaders().stream().map(FileHeader::getFileName);
         }
         private String rawName(String entry) throws IOException {
-            if (!entry.contains("/")) return entry;
             if (!namesScanned) {
                 rawNames = new HashMap<>();
                 try (java.util.stream.Stream<String> names = names()) {
                     Iterator<String> iterator = names.iterator();
                     while (iterator.hasNext()) {
                         Tasks.Progress.check(); String raw = iterator.next(), path = zipPath(raw);
+                        if (path.isEmpty()) continue;
                         if (rawNames.putIfAbsent(path, raw) != null) throw new IOException("归档存在规范化后重名的条目：" + path);
                         if (rawNames.size() > INDEX_LIMIT) { rawNames = null; break; }
                     }
@@ -430,6 +445,38 @@ final class ArchiveOps {
             if (encryptedZip != null) encryptedZip.close();
         }
     }
+    private static InputStream checkedZipStream(ZipFile zip, ZipEntry entry) throws IOException {
+        InputStream input = zip.getInputStream(entry);
+        return new InputStream() {
+            private final CRC32 crc = new CRC32();
+            private long size;
+
+            @Override public int read() throws IOException {
+                int value = input.read();
+                if (value >= 0) { crc.update(value); size++; }
+                verify(value < 0);
+                return value;
+            }
+
+            @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+                if (length == 0) return 0;
+                int count = input.read(bytes, offset, length);
+                if (count > 0) { crc.update(bytes, offset, count); size += count; }
+                verify(count < 0);
+                return count;
+            }
+
+            private void verify(boolean endOfEntry) throws IOException {
+                if (size > entry.getSize() || endOfEntry && size != entry.getSize())
+                    throw new IOException("ZIP 条目大小不匹配：" + entry.getName());
+                if (endOfEntry && crc.getValue() != entry.getCrc())
+                    throw new IOException("ZIP 条目 CRC32 不匹配：" + entry.getName());
+            }
+
+            @Override public int available() throws IOException { return input.available(); }
+            @Override public void close() throws IOException { input.close(); }
+        };
+    }
     static boolean isRar(File file) {
         String name = file.getName().toLowerCase(Locale.ROOT);
         if (name.endsWith(".rar")) return true;
@@ -442,23 +489,21 @@ final class ArchiveOps {
         } catch (IOException ignored) { return false; }
     }
     static File extractOne(File archive, String entry, File target) throws IOException {
-        if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive) || isSplitZip(archive)) {
-            File parent = target.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("无法创建输出目录");
-            if (target.exists()) throw new IOException("解压目标已存在：" + target.getName());
-            File tmp = File.createTempFile(".rar-entry-", ".tmp", parent);
-            try {
-                try (InputStream in = openEntry(archive, entry); OutputStream out = new FileOutputStream(tmp)) {
-                    copyBounded(in, out, 4L * 1024 * 1024 * 1024);
-                }
-                Files.move(tmp.toPath(), target.toPath());
-            } finally { Files.deleteIfExists(tmp.toPath()); }
+        boolean keepExisting = isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive) || isSplitZip(archive);
+        File parent = target.getAbsoluteFile().getParentFile();
+        if (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) throw new IOException("无法创建输出目录");
+        if (keepExisting && target.exists()) throw new IOException("解压目标已存在：" + target.getName());
+        File tmp = File.createTempFile(".archive-entry-", ".tmp", parent);
+        try {
+            try (InputStream in = openEntry(archive, entry); OutputStream out = new FileOutputStream(tmp)) {
+                if (keepExisting) copyBounded(in, out, 4L * 1024 * 1024 * 1024);
+                else FileStore.pump(in, out);
+            }
+            Tasks.Progress.check();
+            if (keepExisting) Files.move(tmp.toPath(), target.toPath());
+            else FileStore.replace(tmp, target);
             return target;
-        }
-        try (InputStream in = openEntry(archive, entry); OutputStream out = new FileOutputStream(target)) {
-            FileStore.pump(in, out);
-            return target;
-        }
+        } finally { Files.deleteIfExists(tmp.toPath()); }
     }
     static File safeTarget(File root, String path) throws IOException {
         if (path.startsWith("/") || path.startsWith("\\") || path.contains("\\") || path.indexOf('\0') >= 0)
@@ -472,17 +517,30 @@ final class ArchiveOps {
         extract(archive, prefix, output, false);
     }
     static void extract(File archive, String prefix, File output, boolean selected) throws IOException {
+        Tasks.Progress.budget("解压文件", -1);
         if (ArchiveFormats.supported(archive)) { ArchiveFormats.extract(archive, prefix, output, selected); return; }
         if (isRar(archive)) { RarArchiveOps.extract(archive, prefix, output, selected); return; }
         if(isSplitZip(archive)){char[] secret=password(archive);if(secret==null&&isEncryptedZip(archive))throw new PasswordRequired(archive);extractZip4j(archive,prefix,output,selected,secret);return;}
+        prefix = prefix.isEmpty() ? prefix : zipPath(prefix);
         if (!output.isDirectory() && !output.mkdirs()) throw new IOException("无法创建输出目录");
         String selectedName = prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
         selectedName = selectedName.substring(selectedName.lastIndexOf('/') + 1);
         long total = 0;
+        Set<String> names = new HashSet<>();
         try (ZipFile zip = new ZipFile(archive)) {
+            long expected = 0;
+            Enumeration<? extends ZipEntry> headers = zip.entries();
+            while (headers.hasMoreElements()) {
+                Tasks.Progress.check(); ZipEntry header = headers.nextElement();
+                String member = zipPath(header.getName());
+                if (!header.isDirectory() && matchesSelection(member, prefix)) expected = addSize(expected, header.getSize());
+            }
+            Tasks.Progress.budget("解压文件", expected);
             Enumeration<? extends ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry e = entries.nextElement(); String path = zipPath(e.getName());
+                if (path.isEmpty()) continue;
+                if (!names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 if (!prefix.isEmpty() && !path.equals(prefix) && !(prefix.endsWith("/") && path.startsWith(prefix))) continue;
                 Tasks.Progress.step(path);
                 String relative = prefix.endsWith("/") ? path.substring(prefix.length()) : path;
@@ -499,16 +557,10 @@ final class ArchiveOps {
                 if (!parent.isDirectory() && !parent.mkdirs()) throw new IOException("创建目录失败");
                 File tmp = File.createTempFile(".extract-", ".tmp", parent);
                 try {
-                    try (InputStream in = zip.getInputStream(e); OutputStream out = new FileOutputStream(tmp)) {
-                        byte[] buffer = new byte[131072]; int n;
-                        while (true) {
-                            Tasks.Progress.check();n=in.read(buffer);if(n<0)break;if(n==0)continue;
-                            total += n;
-                            if (total > 4L * 1024 * 1024 * 1024) throw new IOException("本次解压超过 4 GiB 上限");
-                            out.write(buffer, 0, n);
-                            Tasks.Progress.bytes(n);
-                        }
+                    try (InputStream in = checkedZipStream(zip, e); OutputStream out = new FileOutputStream(tmp)) {
+                        total += copyBounded(in, out, 4L * 1024 * 1024 * 1024 - total);
                     }
+                    Tasks.Progress.check();
                     FileTimes.extracted(tmp,e.getTime());
                     Files.move(tmp.toPath(), target.toPath());
                 } finally { Files.deleteIfExists(tmp.toPath()); }
@@ -521,14 +573,24 @@ final class ArchiveOps {
         }
     }
     private static void extractZip4j(File archive, String prefix, File output, boolean selected, char[] password) throws IOException {
+        prefix = prefix.isEmpty() ? prefix : zipPath(prefix);
         if(!output.isDirectory()&&!output.mkdirs())throw new IOException("无法创建输出目录");
         String selectedName = prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
         selectedName = selectedName.substring(selectedName.lastIndexOf('/') + 1);
         long total = 0;
+        Set<String> names = new HashSet<>();
         net.lingala.zip4j.ZipFile zip = new net.lingala.zip4j.ZipFile(archive, password);
         try {
+            long expected = 0;
+            for (FileHeader header : zip.getFileHeaders()) {
+                Tasks.Progress.check();
+                if (!header.isDirectory() && matchesSelection(zipPath(header.getFileName()), prefix)) expected = addSize(expected, header.getUncompressedSize());
+            }
+            Tasks.Progress.budget("解压文件", expected);
             for (FileHeader header : zip.getFileHeaders()) {
                 String path = zipPath(header.getFileName());
+                if (path.isEmpty()) continue;
+                if (!names.add(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
                 boolean directory = header.isDirectory() || path.endsWith("/");
                 String normalized = directory && path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
                 validateEntry(normalized);
@@ -567,8 +629,7 @@ final class ArchiveOps {
         rewriteBatch(archive, Collections.emptyMap(), removals);
     }
     static void rewriteBatch(File archive, Map<String, File> additions, Set<String> removals) throws IOException {
-        for (String name : removals) { validateEntry(name); if (name.isEmpty()) throw new IOException("不能删除归档根目录"); }
-        rewrite(archive, null, null, additions, removals);
+        rewrite(archive, null, null, additions, normalizedRemovals(removals));
     }
     static void renameAll(File archive, Map<String, String> renames) throws IOException {
         synchronized (lock(archive)) { renameAllLocked(archive, renames); }
@@ -576,7 +637,7 @@ final class ArchiveOps {
     private static void renameAllLocked(File archive, Map<String, String> renames) throws IOException {
         if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive) || isSplitZip(archive))
             throw new IOException("此格式暂不支持直接重命名，请先解压");
-        for (Map.Entry<String, String> item : renames.entrySet()) { validateEntry(item.getKey()); validateEntry(item.getValue()); }
+        renames = normalizedRenames(renames);
         FileStore.FileState before = FileStore.FileState.read(archive);
         File temp = File.createTempFile(".archive-renames-", ".zip", archive.getParentFile());
         try {
@@ -587,6 +648,7 @@ final class ArchiveOps {
                 while (entries.hasMoreElements()) {
                     Tasks.Progress.check();
                     var entry = entries.nextElement(); String name = zipPath(entry.getName()), target = name;
+                    if (name.isEmpty()) continue;
                     if (ApkInstall.isApkName(archive.getName()) && isSignature(name)) continue;
                     for (var rename : renames.entrySet()) if (name.equals(rename.getKey()) || rename.getKey().endsWith("/") && name.startsWith(rename.getKey())) {
                         target = rename.getValue() + name.substring(rename.getKey().length()); break;
@@ -631,8 +693,10 @@ final class ArchiveOps {
             FileStore.FileState before = known == null ? FileStore.FileState.read(archive) : known;
             if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive) || isSplitZip(archive))
                 throw new IOException("此归档格式暂不支持直接修改，请先解压后编辑");
-            for (String name : additions.keySet()) validateEntry(name);
-            if (rename != null) validateEntry(rename);
+            additions = normalizedAdditions(additions);
+            removals = normalizedRemovals(removals);
+            if (remove != null) remove = entryPath(remove);
+            if (rename != null) rename = entryPath(rename);
             File tmp = File.createTempFile(".archive-", ".zip", archive.getParentFile());
             boolean apk = ApkInstall.isApkName(archive.getName());
             try {
@@ -658,7 +722,9 @@ final class ArchiveOps {
 
     static void rewriteSplitCompressed(File archive, java.nio.file.Path[] volumes, File output, long volumeSize, Map<String, String> renames,
                                        Map<String, File> additions, Set<String> removals) throws IOException {
-        for (var item : renames.entrySet()) { validateEntry(item.getKey()); validateEntry(item.getValue()); }
+        renames = normalizedRenames(renames);
+        additions = normalizedAdditions(additions);
+        removals = normalizedRemovals(removals);
         writeSplitZipResult(archive, volumes, output, volumeSize, renames, additions, removals);
         if (!isSplitZip(output)) {
             // Commons Compress leaves a split signature even when the result fits into one disk.
@@ -691,6 +757,7 @@ final class ArchiveOps {
                 Tasks.Progress.check();
                 org.apache.commons.compress.archivers.zip.ZipArchiveEntry entry = entries.nextElement();
                 String name = zipPath(entry.getName());
+                if (name.isEmpty()) continue;
                 if (!names.add(name)) throw new IOException("归档存在规范化后重名的条目：" + name);
                 if (removals.contains(name) || removedParent(name, removals) || apk && isSignature(name)
                         || additions.containsKey(name)) continue;
@@ -748,16 +815,54 @@ final class ArchiveOps {
                 || upper.endsWith(".EC") || upper.startsWith("META-INF/SIG-")));
     }
     static void validateEntry(String name) throws IOException {
-        if (name.isEmpty() || name.startsWith("/") || name.contains("\\") || name.indexOf('\0') >= 0
-                || name.matches("(?s)^[A-Za-z]:.*"))
-            throw new IOException("归档路径无效");
-        String[] pieces = name.split("/", -1);
-        for (int i = 0; i < pieces.length; i++)
-            if (pieces[i].equals(".") || pieces[i].equals("..") || pieces[i].isEmpty() && i != pieces.length - 1)
-                throw new IOException("归档路径无效");
+        if (name.contains("\\")) throw new IOException("归档路径无效");
+        // New names stay canonical; legacy ZIP member names are mapped separately by zipPath.
+        if (!entryPath(name).equals(name)) throw new IOException("归档路径无效");
     }
+    /** Map legacy ZIP separators and harmless dot segments to one public member name. */
     private static String zipPath(String raw) throws IOException {
-        String path = raw.replace('\\', '/'); validateEntry(path); return path;
+        String path = raw.replace('\\', '/');
+        if (path.isEmpty() || path.startsWith("/") || path.indexOf('\0') >= 0
+                || path.matches("(?s)^[A-Za-z]:.*")) throw new IOException("归档路径无效");
+        String[] pieces = path.split("/", -1);
+        StringJoiner normalized = new StringJoiner("/");
+        for (int i = 0; i < pieces.length; i++) {
+            String piece = pieces[i];
+            if (piece.equals("..") || piece.isEmpty() && i != pieces.length - 1)
+                throw new IOException("归档路径无效");
+            if (!piece.isEmpty() && !piece.equals(".")) normalized.add(piece);
+        }
+        String result = normalized.toString();
+        if (result.matches("(?s)^[A-Za-z]:.*")) throw new IOException("归档路径无效");
+        return !result.isEmpty() && (path.endsWith("/") || path.endsWith("/.")) ? result + "/" : result;
+    }
+    private static String entryPath(String name) throws IOException {
+        String path = zipPath(name);
+        if (path.isEmpty()) throw new IOException("不能操作归档根目录");
+        return path;
+    }
+    private static Map<String, File> normalizedAdditions(Map<String, File> additions) throws IOException {
+        Map<String, File> result = new LinkedHashMap<>();
+        for (var entry : additions.entrySet()) {
+            String path = entryPath(entry.getKey());
+            if (result.containsKey(path)) throw new IOException("归档存在规范化后重名的条目：" + path);
+            result.put(path, entry.getValue());
+        }
+        return result;
+    }
+    private static Map<String, String> normalizedRenames(Map<String, String> renames) throws IOException {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (var entry : renames.entrySet()) {
+            String path = entryPath(entry.getKey());
+            if (result.putIfAbsent(path, entryPath(entry.getValue())) != null)
+                throw new IOException("归档存在规范化后重名的条目：" + path);
+        }
+        return result;
+    }
+    private static Set<String> normalizedRemovals(Set<String> removals) throws IOException {
+        Set<String> result = new HashSet<>();
+        for (String name : removals) result.add(entryPath(name));
+        return result;
     }
     private static long copyBounded(InputStream in, OutputStream out, long limit) throws IOException {
         byte[] buffer = new byte[131072]; long total = 0; int n;
@@ -770,6 +875,10 @@ final class ArchiveOps {
         }
         return total;
     }
+    static boolean matchesSelection(String path, String prefix) {
+        return prefix.isEmpty() || path.equals(prefix) || prefix.endsWith("/") && path.startsWith(prefix);
+    }
+    static long addSize(long total, long size) { return total < 0 || size < 0 || total > Long.MAX_VALUE - size ? -1 : total + size; }
     static void pack(FileStore store, List<FileStore.Node> nodes, File output) throws IOException {
         pack(store, nodes, output, "zip", new char[0]);
     }

@@ -61,16 +61,32 @@ final class ApkInstall {
             // Concurrent cleanup or an unreadable expired session must not break a new share.
         }
     }
-    static String silentCommand(File file) {
-        // su reads the private file; Package Manager receives bytes rather than a private path.
-        return "/system/bin/pm install -r -S " + file.length() + " < " + FileStore.quote(file.getAbsolutePath());
+    static String silentCommand(long size, int userId) {
+        // With a size and no path, pm reads the APK from stdin.
+        return "/system/bin/pm install -r --user " + userId + " -S " + size;
     }
     static String silent(File file) throws IOException {
-        ShellRunner.Result result = new ShellRunner().run(silentCommand(file), null, true, 120000, null, false);
+        return silent(file, new ShellRunner());
+    }
+    static String silent(File file, ShellRunner runner) throws IOException {
+        long size = file.length();
+        if (size <= 0 || !file.isFile()) throw new IOException("安装缓存已失效，请重新打开 APK");
+        ShellRunner.Result result;
+        try (InputStream input = new FileInputStream(file)) {
+            result = runner.run(silentCommand(size, SplitApks.currentUserId()), null, true, 120000, null, false, input);
+        }
         if (result.timedOut()) throw new IOException("安装超过 120 秒，已停止");
-        if (result.exitCode() != 0 || !result.output().trim().matches("(?s)(?:.*\\n)?Success"))
+        if (result.stopped()) throw new IOException("安装已停止");
+        if (result.exitCode() != 0 || !hasShellSuccess(result.output(), false))
             throw new IOException("静默安装失败（需 ROOT 授权）\nexit " + result.exitCode() + "\n" + result.output());
         return "安装成功";
+    }
+    static boolean hasShellSuccess(String output, boolean writingSplit) {
+        for (String line : output.split("\\r?\\n")) {
+            String value = line.trim();
+            if (value.equals("Success") || writingSplit && value.matches("Success: streamed [0-9]+ bytes")) return true;
+        }
+        return false;
     }
     private ApkInstall() {}
 }

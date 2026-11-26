@@ -48,11 +48,18 @@ public final class DataDocumentsProvider extends DocumentsProvider {
         catch (Exception error) { throw failure(error); }
     }
     @Override public Cursor queryChildDocuments(String parentDocumentId, String[] projection, String sortOrder) throws FileNotFoundException {
+        return children(getContext(), parentDocumentId, projection, null);
+    }
+    static Cursor children(android.content.Context context, String parentDocumentId, String[] projection, CancellationSignal signal) throws FileNotFoundException {
         MatrixCursor cursor = new MatrixCursor(projection == null ? COLUMNS : projection);
         try {
-            IDataAccess service = remote(); int offset = 0;
+            if (signal != null) signal.throwIfCanceled();
+            IDataListing listing = ShizukuStorage.remote(context).list(parentDocumentId);
+            int offset = 0;
             do {
-                Bundle page = service.list(parentDocumentId, offset);
+                if (signal != null) signal.throwIfCanceled();
+                Tasks.Progress.check();
+                Bundle page = listing.page(offset);
                 ArrayList<Bundle> entries = page.getParcelableArrayList("entries");
                 if (entries == null) throw new IOException("Shizuku 未返回目录列表");
                 for (Bundle entry : entries) add(cursor, entry);
@@ -60,8 +67,10 @@ public final class DataDocumentsProvider extends DocumentsProvider {
                 if (next != -1 && next <= offset) throw new IOException("目录分页无效");
                 offset = next;
             } while (offset != -1);
+            cursor.setNotificationUri(context.getContentResolver(), childrenUri(parentDocumentId));
             return cursor;
-        } catch (Exception error) { throw failure(error); }
+        } catch (OperationCanceledException cancelled) { cursor.close(); throw cancelled; }
+        catch (Exception error) { cursor.close(); throw failure(error); }
     }
     private static void add(MatrixCursor cursor, Bundle info) {
         String path = info.getString("path"), name = info.getString("name"); boolean directory = info.getBoolean("directory");
@@ -93,16 +102,19 @@ public final class DataDocumentsProvider extends DocumentsProvider {
         catch (Exception error) { throw failure(error); }
     }
     @Override public String renameDocument(String documentId, String displayName) throws FileNotFoundException {
-        try { String renamed = remote().rename(documentId, displayName); changed(documentId); changed(renamed); return renamed; }
+        try { String renamed = remote().rename(documentId, displayName); changed(new File(renamed).getParent()); return renamed; }
         catch (Exception error) { throw failure(error); }
     }
     @Override public void deleteDocument(String documentId) throws FileNotFoundException {
-        try { remote().delete(documentId); changed(documentId); }
+        try { remote().delete(documentId); changed(new File(documentId).getParent()); }
         catch (Exception error) { throw failure(error); }
     }
-    private void changed(String path) {
-        File parent = path == null ? null : new File(path).getParentFile();
-        if (parent != null) getContext().getContentResolver().notifyChange(uri(parent.getPath()), null);
+    private static Uri childrenUri(String parent) {
+        return DocumentsContract.buildChildDocumentsUriUsingTree(uri(parent), parent);
+    }
+    private void changed(String parent) {
+        try { getContext().getContentResolver().notifyChange(childrenUri(parent), null); }
+        catch (RuntimeException error) { android.util.Log.w("DataDocumentsProvider", "目录已修改，刷新通知发送失败", error); }
     }
     @Override public boolean isChildDocument(String parentDocumentId, String documentId) {
         return normalized(parentDocumentId) && normalized(documentId) && documentId.startsWith(parentDocumentId + "/");

@@ -49,6 +49,39 @@ public class ZipCompatibilityInstrumentedTest {
         }
         assertFalse(new File(work, "outside").exists());
     }
+    @Test public void corruptStoredPayloadIsRejectedAndNeverPublished() throws Exception {
+        File zip = new File(work, "corrupt.zip");
+        byte[] payload = {11, 22, 33, 44};
+        CRC32 crc = new CRC32(); crc.update(payload);
+        ZipEntry entry = new ZipEntry("data.bin");
+        entry.setMethod(ZipEntry.STORED);
+        entry.setTime(1700000000000L);
+        entry.setSize(payload.length);
+        entry.setCrc(crc.getValue());
+        try (ZipOutputStream out = new ZipOutputStream(new FileOutputStream(zip))) {
+            out.putNextEntry(entry); out.write(payload); out.closeEntry();
+        }
+        try (RandomAccessFile file = new RandomAccessFile(zip, "rw")) {
+            file.seek(30 + "data.bin".length()); // The fixture's local header has no extra fields.
+            assertEquals(11, file.read());
+            file.seek(file.getFilePointer() - 1);
+            file.write(99);
+        }
+        assertEquals("data.bin", ArchiveOps.list(zip, "").get(0).name());
+        failure(() -> ArchiveOps.bytes(zip, "data.bin", 16));
+        File output = new File(work, "output");
+        failure(() -> ArchiveOps.extract(zip, "", output));
+        assertArrayEquals(new String[0], output.list());
+        FileStore store = new FileStore(context);
+        FileStore.Node member = FileStore.archiveNode(FileStore.local(zip), "data.bin", false, payload.length, 0);
+        failure(() -> store.copy(member, FileStore.local(output), false));
+        assertArrayEquals(new String[0], output.list());
+        File existing = new File(output, "existing.bin");
+        Files.write(existing.toPath(), payload);
+        failure(() -> ArchiveOps.extractOne(zip, "data.bin", existing));
+        assertArrayEquals(payload, Files.readAllBytes(existing.toPath()));
+        assertArrayEquals(new String[]{"existing.bin"}, output.list());
+    }
     @Test public void removalPreservesCompressedBytesMetadataAndComment() throws Exception {
         File zip = new File(work, "raw.zip"); byte[] payload = new byte[512 * 1024]; new Random(23).nextBytes(payload);
         try (org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream out = new org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream(zip)) {

@@ -64,21 +64,16 @@ public class NoRootFlowsInstrumentedTest {
     @Test public void missingBookmarkOpensItsExistingParentAndThePaneRemainsUsable() throws Exception {
         File missing = new File(work, "missing/nested");
         DirectoryPlaces bookmarks = new DirectoryPlaces(context);
+        bookmarks.clear(true);
         bookmarks.bookmark(DirectoryPlaces.Entry.from(FileStore.directory(missing, false)));
         launch();
+        scenario.onActivity(activity -> invoke(field(activity, "left"), "navigate", FileStore.directory(right, false)));
+        await(right);
         scenario.onActivity(activity -> invoke(activity, "directorySheet"));
-        UiObject2 bookmark = device.wait(Until.findObject(By.desc("目录快捷项 nested")), 1500);
-        if (bookmark == null) {
-            UiObject2 panel = device.wait(Until.findObject(By.desc("最近与书签面板")), 5000); assertNotNull(panel);
-            android.graphics.Rect bounds = panel.getVisibleBounds();
-            for (int i = 0; i < 4 && bookmark == null; i++) {
-                device.swipe(bounds.centerX(), bounds.bottom - 30, bounds.centerX(), bounds.top + 30, 12);
-                bookmark = device.wait(Until.findObject(By.desc("目录快捷项 nested")), 1000);
-            }
-        }
+        UiObject2 bookmark = device.wait(Until.findObject(By.desc("目录快捷项 nested")), 5000);
         assertNotNull(bookmark); bookmark.click();
         await(work);
-        device.wait(Until.gone(By.desc("最近与书签面板")), 5000);
+        assertTrue(device.wait(Until.gone(By.desc("最近与书签面板")), 5000));
         UiObject2 child = device.wait(Until.findObject(By.text("child")), 5000); assertNotNull(child); child.click();
         await(new File(work, "child"));
     }
